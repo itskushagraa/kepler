@@ -5,11 +5,6 @@
 Bitboard KNIGHT_ATTACKS[64];
 Bitboard KING_ATTACKS[64];
 
-void MoveList::add(int from, int to, bool capture, bool promo)
-{
-    moves.push_back({from, to, capture, promo});
-}
-
 void MoveList::print() const
 {
     for (const auto &m : moves)
@@ -20,7 +15,16 @@ void MoveList::print() const
         char trank = '1' + (m.to / 8);
         std::cout << ffile << frank << tfile << trank;
         if (m.isPromotion)
-            std::cout << "(promo)";
+        {
+            char pc = 'q';
+            if (m.promoPiece == PROMO_ROOK)
+                pc = 'r';
+            else if (m.promoPiece == PROMO_BISHOP)
+                pc = 'b';
+            else if (m.promoPiece == PROMO_KNIGHT)
+                pc = 'n';
+            std::cout << "(promo=" << pc << ")";
+        }
         if (m.isCapture)
             std::cout << "x";
         std::cout << "\n";
@@ -363,7 +367,10 @@ void generatePawnMoves(const Position &pos, MoveList &ml)
         {
             int to = lsb(tmp);
             int from = to - 8;
-            ml.add(from, to, false, true);
+            ml.add(from, to, false, true, PROMO_QUEEN);
+            ml.add(from, to, false, true, PROMO_ROOK);
+            ml.add(from, to, false, true, PROMO_BISHOP);
+            ml.add(from, to, false, true, PROMO_KNIGHT);
             tmp &= tmp - 1;
         }
 
@@ -411,8 +418,18 @@ void generatePawnMoves(const Position &pos, MoveList &ml)
         {
             int to = lsb(t);
             int from = to - 7;
-            bool promo = (to >= 56); // rank 8
-            ml.add(from, to, /*capture=*/true, /*promo=*/promo);
+            bool promo = (to >= 56);
+            if (!promo)
+            {
+                ml.add(from, to, /*capture=*/true, /*promo=*/false);
+            }
+            else
+            {
+                ml.add(from, to, true, true, PROMO_QUEEN);
+                ml.add(from, to, true, true, PROMO_ROOK);
+                ml.add(from, to, true, true, PROMO_BISHOP);
+                ml.add(from, to, true, true, PROMO_KNIGHT);
+            }
             t &= t - 1;
         }
 
@@ -421,8 +438,18 @@ void generatePawnMoves(const Position &pos, MoveList &ml)
         {
             int to = lsb(t);
             int from = to - 9;
-            bool promo = (to >= 56); // rank 8
-            ml.add(from, to, /*capture=*/true, /*promo=*/promo);
+            bool promo = (to >= 56);
+            if (!promo)
+            {
+                ml.add(from, to, /*capture=*/true, /*promo=*/false);
+            }
+            else
+            {
+                ml.add(from, to, true, true, PROMO_QUEEN);
+                ml.add(from, to, true, true, PROMO_ROOK);
+                ml.add(from, to, true, true, PROMO_BISHOP);
+                ml.add(from, to, true, true, PROMO_KNIGHT);
+            }
             t &= t - 1;
         }
     }
@@ -448,7 +475,10 @@ void generatePawnMoves(const Position &pos, MoveList &ml)
         {
             int to = lsb(tmp);
             int from = to + 8;
-            ml.add(from, to, false, true);
+            ml.add(from, to, false, true, PROMO_QUEEN);
+            ml.add(from, to, false, true, PROMO_ROOK);
+            ml.add(from, to, false, true, PROMO_BISHOP);
+            ml.add(from, to, false, true, PROMO_KNIGHT);
             tmp &= tmp - 1;
         }
 
@@ -490,23 +520,45 @@ void generatePawnMoves(const Position &pos, MoveList &ml)
         Bitboard capL = south(west(bpawns)) & pos.occupancy[WHITE]; // from = to + 9 (black SW)
         Bitboard capR = south(east(bpawns)) & pos.occupancy[WHITE]; // from = to + 7 (black SE)
 
+        // BLACK capture promos — left
         Bitboard t = capL;
         while (t)
         {
             int to = lsb(t);
             int from = to + 9;
-            bool promo = (to <= 7); // rank 1
-            ml.add(from, to, /*capture=*/true, /*promo=*/promo);
+            bool promo = (to <= 7);
+            if (!promo)
+            {
+                ml.add(from, to, /*capture=*/true, /*promo=*/false);
+            }
+            else
+            {
+                ml.add(from, to, true, true, PROMO_QUEEN);
+                ml.add(from, to, true, true, PROMO_ROOK);
+                ml.add(from, to, true, true, PROMO_BISHOP);
+                ml.add(from, to, true, true, PROMO_KNIGHT);
+            }
             t &= t - 1;
         }
 
+        // BLACK capture promos — right
         t = capR;
         while (t)
         {
             int to = lsb(t);
             int from = to + 7;
-            bool promo = (to <= 7); // rank 1
-            ml.add(from, to, /*capture=*/true, /*promo=*/promo);
+            bool promo = (to <= 7);
+            if (!promo)
+            {
+                ml.add(from, to, /*capture=*/true, /*promo=*/false);
+            }
+            else
+            {
+                ml.add(from, to, true, true, PROMO_QUEEN);
+                ml.add(from, to, true, true, PROMO_ROOK);
+                ml.add(from, to, true, true, PROMO_BISHOP);
+                ml.add(from, to, true, true, PROMO_KNIGHT);
+            }
             t &= t - 1;
         }
     }
@@ -630,7 +682,8 @@ void generateLegalMoves(const Position &pos, MoveList &legal)
                     continue; // can't pass through or into check
             }
 
-            legal.add(m.from, m.to, m.isCapture, m.isPromotion);
+            // preserve promo kind (defaults to Q only if you came from old path)
+            legal.add(m.from, m.to, m.isCapture, m.isPromotion, m.promoPiece);
         }
     }
 }

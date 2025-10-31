@@ -71,8 +71,8 @@ void runUciLoop()
         {
             MoveList ml;
             //pos.fromFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQK2R w KQkq - 0 1");
-            pos.fromFEN("8/8/8/1Pp5/8/8/8/4K2R w K c6 0 1");
-            generateAllMoves(pos, ml);
+            pos.fromFEN("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1");
+            generateLegalMoves(pos, ml);
             ml.print();
         }
         else if (cmd.rfind("go", 0) == 0)

@@ -97,36 +97,68 @@ int main(int argc, char **argv)
 {
     initAttackTables();
 
-    Position pos;
-    pos.setStartPos();
-
-    // Args: ./perft [depth=8] [threads=hardware_concurrency]
+    // Depth and threading settings
     int depth = (argc >= 2 ? std::max(1, std::atoi(argv[1])) : 6);
     int threads = (argc >= 3 ? std::max(1, std::atoi(argv[2]))
                              : (int)std::max(1u, std::thread::hardware_concurrency()));
 
-    std::printf("Threads: %d\n", threads);
+    std::printf("Threads: %d\n\n", threads);
 
-    // Time each depth up to requested 'depth'.
-    for (int d = 1; d <= depth; ++d)
+    // Official ChessProgramming.org perft suite (6 positions)
+    struct Test
     {
-        if (d <= 6)
+        const char *name;
+        const char *fen;
+    };
+
+    static const Test tests[] = {
+        {"Position 1 – Initial",
+         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"},
+
+        {"Position 2 – Kiwipete",
+         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"},
+
+        {"Position 3 – EP Validation",
+         "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"},
+
+        {"Position 4 – EP Pin / Discovered Check",
+         "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1"},
+
+        {"Position 5 – Castling",
+         "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8"},
+
+        {"Position 6 – Tricky Knight / Stalemate Patterns",
+         "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"}};
+
+    constexpr int N = sizeof(tests) / sizeof(Test);
+
+    // Loop and run each test
+    for (int t = 0; t < N; ++t)
+    {
+        std::printf("=== %s ===\nFEN: %s\n", tests[t].name, tests[t].fen);
+
+        Position pos;
+        pos.fromFEN(tests[t].fen);
+
+        for (int d = 1; d <= 5; ++d)
         {
-            // single-thread is fine (and good for baseline)
-            Position p = pos;
-            char label[64];
-            std::snprintf(label, sizeof(label), "Depth %d (single)", d);
-            time_run(label, [&]
-                     { return perft(p, d); });
+            if (d <= 5)
+            {
+                Position p = pos;
+                char label[64];
+                std::snprintf(label, sizeof(label), "Depth %d (single)", d);
+                time_run(label, [&]
+                         { return perft(p, d); });
+            }
+            else
+            {
+                char label[64];
+                std::snprintf(label, sizeof(label), "Depth %d (root-parallel x%d)", d, threads);
+                time_run(label, [&]
+                         { return perft_root_parallel(pos, d, threads); });
+            }
         }
-        else
-        {
-            // parallelize the root for deep depths
-            char label[64];
-            std::snprintf(label, sizeof(label), "Depth %d (root-parallel x%d)", d, threads);
-            time_run(label, [&]
-                     { return perft_root_parallel(pos, d, threads); });
-        }
+        std::printf("\n");
     }
 
     return 0;

@@ -199,13 +199,58 @@ void Position::makeMove(const Move &m)
     // 3. Promotion — only for pawns that reached last rank.
     if (m.isPromotion && movedIndex >= 0)
     {
-        // clear pawn we just moved
+        // remove the pawn at destination
         clear_bit(pieceBB[movedIndex], m.to);
-        // add a queen of the same color
-        int qIndex = (us == WHITE ? WQ : BQ);
-        set_bit(pieceBB[qIndex], m.to);
+
+        // choose piece (default to queen if none supplied)
+        int addIdx = -1;
+        uint8_t pp = (m.promoPiece == PROMO_NONE ? PROMO_QUEEN : m.promoPiece);
+
+        if (us == WHITE)
+        {
+            switch (pp)
+            {
+            case PROMO_QUEEN:
+                addIdx = WQ;
+                break;
+            case PROMO_ROOK:
+                addIdx = WR;
+                break;
+            case PROMO_BISHOP:
+                addIdx = WB;
+                break;
+            case PROMO_KNIGHT:
+                addIdx = WN;
+                break;
+            default:
+                addIdx = WQ;
+                break;
+            }
+        }
+        else
+        {
+            switch (pp)
+            {
+            case PROMO_QUEEN:
+                addIdx = BQ;
+                break;
+            case PROMO_ROOK:
+                addIdx = BR;
+                break;
+            case PROMO_BISHOP:
+                addIdx = BB;
+                break;
+            case PROMO_KNIGHT:
+                addIdx = BN;
+                break;
+            default:
+                addIdx = BQ;
+                break;
+            }
+        }
+        set_bit(pieceBB[addIdx], m.to);
     }
-    
+
     // 3.5 Castling rook shift if the moved piece was a king and moved two squares
     if (movedIndex == WK)
     {
