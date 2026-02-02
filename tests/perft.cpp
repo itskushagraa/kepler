@@ -1,6 +1,7 @@
 // perft.cpp
 #include "../src/position.hpp"
 #include "../src/movegen.hpp"
+#include "../src/zobrist.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -96,6 +97,7 @@ uint64_t time_run(const char *label, F &&fn, double *out_sec = nullptr)
 int main(int argc, char **argv)
 {
     initAttackTables();
+    Zobrist::init();
 
     // Depth and threading settings
     int depth = (argc >= 2 ? std::max(1, std::atoi(argv[1])) : 6);
