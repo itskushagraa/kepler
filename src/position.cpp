@@ -277,7 +277,10 @@ void Position::makeMove(const Move &m, Undo &u)
     u.prevHalfmoveClock = halfmoveClock;
     u.prevFullmoveNumber = fullmoveNumber;
     u.prevHash = hashKey;
-    u.prevAccumulator = nnueAccumulator;
+    u.promotionIndex = -1;
+    u.castleRookPiece = -1;
+    u.castleRookFrom = -1;
+    u.castleRookTo = -1;
 
     // 1. Remove our piece from the origin and move it.
     int movedIndex = -1;
@@ -498,6 +501,10 @@ void Position::makeMove(const Move &m, Undo &u)
     // 5. Flip side
     sideToMove = them;
     hashKey ^= Zobrist::side();
+    u.promotionIndex = promotionIndex;
+    u.castleRookPiece = castleRookPiece;
+    u.castleRookFrom = castleRookFrom;
+    u.castleRookTo = castleRookTo;
     Nnue::applyMove(
         nnueAccumulator,
         movedIndex, m.from, m.to,
@@ -588,7 +595,13 @@ void Position::unmakeMove(const Move &m, const Undo &u)
     halfmoveClock = u.prevHalfmoveClock;
     fullmoveNumber = u.prevFullmoveNumber;
     hashKey = u.prevHash;
-    nnueAccumulator = u.prevAccumulator;
+    Nnue::unapplyMove(
+        nnueAccumulator,
+        u.movedIndex, m.from, m.to,
+        u.capturedIndex, u.capturedSquare,
+        u.promotionIndex,
+        u.castleRookPiece, u.castleRookFrom, u.castleRookTo,
+        u.prevHash);
 }
 
 bool Position::isSquareAttacked(int sq, Side bySide) const

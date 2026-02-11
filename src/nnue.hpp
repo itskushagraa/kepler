@@ -7,13 +7,17 @@ class Position;
 
 namespace Nnue
 {
-    constexpr int kInputSize = 768;  // 12 pieces * 64 squares
-    constexpr int kHiddenSize = 128; // starter scaffold size
+    constexpr int kPsqtInputSize = 768;     // 12 pieces * 64 squares
+    constexpr int kHalfKPInputSize = 41024; // 64 * (10 * 64 + 1)
+    constexpr int kMaxHiddenSize = 1536;    // supports larger HalfKP nets
 
     struct Accumulator
     {
-        std::array<int32_t, kHiddenSize> hidden{};
-        bool initialized = false;
+        std::array<int32_t, kMaxHiddenSize> classicHidden{};
+        std::array<std::array<int32_t, kMaxHiddenSize>, 2> halfHidden{};
+        bool classicValid = false;
+        std::array<bool, 2> halfValid{false, false};
+        std::array<int, 2> kingSq{-1, -1};
         uint64_t positionKey = 0;
     };
 
@@ -28,5 +32,12 @@ namespace Nnue
         int promotionPiece,
         int castleRookPiece, int castleRookFrom, int castleRookTo,
         uint64_t newPositionKey);
+    void unapplyMove(
+        Accumulator &acc,
+        int movedPiece, int from, int to,
+        int capturedPiece, int capturedSquare,
+        int promotionPiece,
+        int castleRookPiece, int castleRookFrom, int castleRookTo,
+        uint64_t previousPositionKey);
     bool evaluate(const Position &pos, Accumulator &acc, int &scoreOut);
 }

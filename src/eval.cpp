@@ -2,6 +2,7 @@
 #include "movegen.hpp"
 #include "nnue.hpp"
 #include <algorithm>
+#include <cstdlib>
 
 namespace
 {
@@ -151,6 +152,104 @@ namespace
     Bitboard fileMask(int file)
     {
         return FILE_A << file;
+    }
+
+    int manhattanDist(int a, int b)
+    {
+        return std::abs((a & 7) - (b & 7)) + std::abs((a >> 3) - (b >> 3));
+    }
+
+    int materialWithoutKing(const Position &pos, Side side)
+    {
+        if (side == WHITE)
+        {
+            return popcount(pos.pieceBB[WP]) * kEgValue[0] +
+                   popcount(pos.pieceBB[WN]) * kEgValue[1] +
+                   popcount(pos.pieceBB[WB]) * kEgValue[2] +
+                   popcount(pos.pieceBB[WR]) * kEgValue[3] +
+                   popcount(pos.pieceBB[WQ]) * kEgValue[4];
+        }
+        return popcount(pos.pieceBB[BP]) * kEgValue[0] +
+               popcount(pos.pieceBB[BN]) * kEgValue[1] +
+               popcount(pos.pieceBB[BB]) * kEgValue[2] +
+               popcount(pos.pieceBB[BR]) * kEgValue[3] +
+               popcount(pos.pieceBB[BQ]) * kEgValue[4];
+    }
+
+    int bishopPairScore(const Position &pos)
+    {
+        int score = 0;
+        if (popcount(pos.pieceBB[WB]) >= 2)
+            score += 28;
+        if (popcount(pos.pieceBB[BB]) >= 2)
+            score -= 28;
+        return score;
+    }
+
+    int rookActivityScore(const Position &pos)
+    {
+        const Bitboard whitePawns = pos.pieceBB[WP];
+        const Bitboard blackPawns = pos.pieceBB[BP];
+        int score = 0;
+
+        Bitboard wr = pos.pieceBB[WR];
+        while (wr)
+        {
+            int sq = lsb(wr);
+            wr &= wr - 1;
+            int file = sq & 7;
+            Bitboard fm = fileMask(file);
+            bool ownPawn = (whitePawns & fm) != 0ULL;
+            bool oppPawn = (blackPawns & fm) != 0ULL;
+            if (!ownPawn && !oppPawn)
+                score += 18;
+            else if (!ownPawn)
+                score += 10;
+            if ((sq >> 3) == 6)
+                score += 14;
+        }
+
+        Bitboard br = pos.pieceBB[BR];
+        while (br)
+        {
+            int sq = lsb(br);
+            br &= br - 1;
+            int file = sq & 7;
+            Bitboard fm = fileMask(file);
+            bool ownPawn = (blackPawns & fm) != 0ULL;
+            bool oppPawn = (whitePawns & fm) != 0ULL;
+            if (!ownPawn && !oppPawn)
+                score -= 18;
+            else if (!ownPawn)
+                score -= 10;
+            if ((sq >> 3) == 1)
+                score -= 14;
+        }
+
+        return score;
+    }
+
+    int mopUpScore(const Position &pos)
+    {
+        const int whiteMat = materialWithoutKing(pos, WHITE);
+        const int blackMat = materialWithoutKing(pos, BLACK);
+        const int diff = whiteMat - blackMat;
+        if (std::abs(diff) < 220)
+            return 0;
+
+        const Side winner = (diff > 0) ? WHITE : BLACK;
+        const Side loser = (winner == WHITE) ? BLACK : WHITE;
+        const int winKing = pos.kingSquare[winner];
+        const int loseKing = pos.kingSquare[loser];
+        if (winKing < 0 || loseKing < 0)
+            return 0;
+
+        // Pull enemy king toward the edge and bring our king closer in won endings.
+        const int enemyEdge =
+            std::abs((loseKing & 7) - 3) + std::abs((loseKing >> 3) - 3);
+        const int kingApproach = 14 - manhattanDist(winKing, loseKing);
+        const int bonus = enemyEdge * 8 + kingApproach * 6;
+        return (diff > 0) ? bonus : -bonus;
     }
 
     int mobilityScore(const Position &pos, Side side)
@@ -357,10 +456,13 @@ namespace
         int score = (mg * phase + eg * (kMaxPhase - phase)) / kMaxPhase;
         score += mobilityScore(pos, WHITE) - mobilityScore(pos, BLACK);
         score += pawnStructureScore(pos);
+        score += bishopPairScore(pos);
+        score += rookActivityScore(pos);
 
         // De-emphasize king safety as pieces come off.
         int kingSafety = kingSafetyScore(pos, WHITE) - kingSafetyScore(pos, BLACK);
         score += (kingSafety * phase) / kMaxPhase;
+        score += (mopUpScore(pos) * (kMaxPhase - phase)) / kMaxPhase;
 
         score += (pos.sideToMove == WHITE) ? kTempoBonus : -kTempoBonus;
         return score;

@@ -172,6 +172,9 @@ void runUciLoop()
     bool hasLastBench = false;
     std::string baselineEvalFile = kDefaultBaselineEvalFile;
     bool useBaseline = true;
+    int searchThreads = 1;
+    int contemptCp = 0;
+    int moveOverheadMs = 10;
 
     auto loadEvalFile = [&](const std::string &path)
     {
@@ -203,6 +206,9 @@ void runUciLoop()
             std::cout << "id name Kepler\n";
             std::cout << "id author Kush Sharma\n";
             std::cout << "option name Hash type spin default 64 min 1 max 1024\n";
+            std::cout << "option name Threads type spin default 1 min 1 max 128\n";
+            std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
+            std::cout << "option name MoveOverhead type spin default 10 min 0 max 500\n";
             std::cout << "option name EvalFile type string default <empty>\n";
             std::cout << "option name BaselineEvalFile type string default " << kDefaultBaselineEvalFile << "\n";
             std::cout << "option name UseBaseline type check default true\n";
@@ -233,6 +239,45 @@ void runUciLoop()
             {
                 int mb = std::stoi(value);
                 tt.resizeMB(mb);
+            }
+            else if (name == "Threads")
+            {
+                int t = 1;
+                try
+                {
+                    t = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    t = searchThreads;
+                }
+                searchThreads = std::clamp(t, 1, 128);
+            }
+            else if (name == "Contempt")
+            {
+                int c = 0;
+                try
+                {
+                    c = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    c = contemptCp;
+                }
+                contemptCp = std::clamp(c, -100, 100);
+            }
+            else if (name == "MoveOverhead")
+            {
+                int overhead = moveOverheadMs;
+                try
+                {
+                    overhead = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    overhead = moveOverheadMs;
+                }
+                moveOverheadMs = std::clamp(overhead, 0, 500);
             }
             else if (name == "EvalFile")
             {
@@ -366,6 +411,9 @@ void runUciLoop()
 
                 SearchLimits limits;
                 limits.depth = depth;
+                limits.threads = searchThreads;
+                limits.contempt = contemptCp;
+                limits.moveOverheadMs = moveOverheadMs;
                 limits.printInfo = false;
 
                 auto t0 = std::chrono::steady_clock::now();
@@ -542,6 +590,9 @@ void runUciLoop()
                     limits.depth = depth;
                     limits.nodes = nodes;
                     limits.printInfo = false;
+                    limits.threads = searchThreads;
+                    limits.contempt = contemptCp;
+                    limits.moveOverheadMs = moveOverheadMs;
 
                     SearchResult sr = search(gamePos, limits, tt, stopFlag);
                     if (ply >= minSamplePly && (ply % sampleEvery) == 0)
@@ -628,6 +679,9 @@ void runUciLoop()
             SearchLimits limits;
             limits.depth = depth;
             limits.movetimeMs = std::max(0, movetimeMs);
+            limits.threads = searchThreads;
+            limits.contempt = contemptCp;
+            limits.moveOverheadMs = moveOverheadMs;
             limits.printInfo = false;
 
             stopFlag.store(false, std::memory_order_relaxed);
@@ -673,9 +727,13 @@ void runUciLoop()
                     iss >> limits.depth;
                 else if (token == "nodes")
                     iss >> limits.nodes;
+                else if (token == "movestogo")
+                    iss >> limits.movesToGo;
                 else if (token == "infinite")
                     limits.infinite = true;
             }
+
+            limits.moveOverheadMs = moveOverheadMs;
 
             if (limits.movetimeMs == 0 && !limits.infinite && limits.depth == 0 && limits.nodes == 0)
             {
@@ -683,7 +741,12 @@ void runUciLoop()
                 int inc = (pos.sideToMove == WHITE) ? limits.wincMs : limits.bincMs;
                 if (remain > 0)
                 {
-                    limits.movetimeMs = std::max(10, remain / 30 + inc / 2);
+                    int safeRemain = std::max(1, remain - limits.moveOverheadMs);
+                    int mtg = (limits.movesToGo > 0) ? limits.movesToGo : 30;
+                    int target = safeRemain / std::max(10, mtg) + (inc * 3) / 4;
+                    int minSpend = std::max(5, safeRemain / 80);
+                    int maxSpend = std::max(20, safeRemain / 2);
+                    limits.movetimeMs = std::clamp(target, minSpend, maxSpend);
                 }
             }
 
@@ -691,6 +754,9 @@ void runUciLoop()
             searching.store(true, std::memory_order_relaxed);
             Position searchPos = pos;
             SearchLimits actualLimits = limits;
+            actualLimits.threads = searchThreads;
+            actualLimits.contempt = contemptCp;
+            actualLimits.moveOverheadMs = moveOverheadMs;
             searchThread = std::thread([searchPos, actualLimits, &tt, &stopFlag, &searching]() mutable
                                        {
                                            SearchResult result = search(searchPos, actualLimits, tt, stopFlag);

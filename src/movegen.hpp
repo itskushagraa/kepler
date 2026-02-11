@@ -1,5 +1,7 @@
 #pragma once
 #include "position.hpp"
+#include <array>
+#include <cstddef>
 
 // attack tables
 extern Bitboard KNIGHT_ATTACKS[64];
@@ -29,7 +31,31 @@ struct Move
 
 struct MoveList
 {
-    std::vector<Move> moves;
+    struct MoveBuffer
+    {
+        static constexpr std::size_t kMaxMoves = 256;
+        std::array<Move, kMaxMoves> data{};
+        std::size_t count = 0;
+
+        void push_back(const Move &m)
+        {
+            if (count < kMaxMoves)
+                data[count++] = m;
+        }
+
+        std::size_t size() const { return count; }
+        bool empty() const { return count == 0; }
+        Move &front() { return data[0]; }
+        const Move &front() const { return data[0]; }
+        Move &operator[](std::size_t i) { return data[i]; }
+        const Move &operator[](std::size_t i) const { return data[i]; }
+        Move *begin() { return data.data(); }
+        Move *end() { return data.data() + count; }
+        const Move *begin() const { return data.data(); }
+        const Move *end() const { return data.data() + count; }
+    };
+
+    MoveBuffer moves;
 
     inline void add(int from, int to, bool capture = false, bool promo = false)
     {

@@ -47,6 +47,10 @@ struct Undo
     int movedIndex = -1;
     int capturedIndex = -1;
     int capturedSquare = -1;
+    int promotionIndex = -1;
+    int castleRookPiece = -1;
+    int castleRookFrom = -1;
+    int castleRookTo = -1;
     int prevEnPassant = -1;
     bool prevCastleK[2]{};
     bool prevCastleQ[2]{};
@@ -54,5 +58,4 @@ struct Undo
     int prevHalfmoveClock = 0;
     int prevFullmoveNumber = 1;
     uint64_t prevHash = 0;
-    Nnue::Accumulator prevAccumulator{};
 };

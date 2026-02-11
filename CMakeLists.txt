@@ -1,8 +1,13 @@
 cmake_minimum_required(VERSION 3.10)
 project(Kepler LANGUAGES CXX)
+include(CheckIPOSupported)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+check_ipo_supported(RESULT KEPLER_IPO_SUPPORTED OUTPUT KEPLER_IPO_ERROR)
+if(KEPLER_IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
 
 file(GLOB SRC_FILES src/*.cpp)
 list(REMOVE_ITEM SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/nnue_tool.cpp")

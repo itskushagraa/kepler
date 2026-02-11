@@ -2,23 +2,35 @@
 #include "eval.hpp"
 #include "zobrist.hpp"
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <chrono>
 #include <iostream>
+#include <thread>
 
 namespace
 {
     constexpr int MATE_SCORE = 30000;
     constexpr int INF_SCORE = 32000;
     constexpr int MAX_PLY = 64;
+    constexpr int MAX_HISTORY = 32767;
 
     constexpr int pieceValuesAbs[12] = {
         100, 320, 330, 500, 900, 0,
         100, 320, 330, 500, 900, 0};
+    constexpr int pieceValuesSee[12] = {
+        100, 320, 330, 500, 900, 20000,
+        100, 320, 330, 500, 900, 20000};
 
     bool sameMove(const Move &a, const Move &b)
     {
         return a.from == b.from && a.to == b.to && a.isPromotion == b.isPromotion &&
                a.promoPiece == b.promoPiece && a.isCastle == b.isCastle;
+    }
+
+    bool isNullMove(const Move &m)
+    {
+        return m.from == 0 && m.to == 0 && !m.isPromotion && !m.isCapture && !m.isCastle;
     }
 
     int scoreToTT(int score, int ply)
@@ -38,6 +50,198 @@ namespace
             return score + ply;
         return score;
     }
+
+    void updateHistory(int &slot, int delta)
+    {
+        slot += delta;
+        if (slot > MAX_HISTORY)
+            slot = MAX_HISTORY;
+        if (slot < -MAX_HISTORY)
+            slot = -MAX_HISTORY;
+    }
+
+    int capturedPieceAt(const Position &pos, const Move &m, Side us)
+    {
+        int captured = pos.pieceIndexAt(m.to);
+        if (captured >= 0)
+            return captured;
+        if (m.isCapture && (pos.pieceIndexAt(m.from) == WP || pos.pieceIndexAt(m.from) == BP) && m.to == pos.enPassantSquare)
+            return (us == WHITE) ? BP : WP;
+        return -1;
+    }
+
+    int moveId(const Move &m)
+    {
+        return (m.from << 6) | m.to;
+    }
+
+    Bitboard pawnAttackersTo(int sq, Side side, Bitboard pawns)
+    {
+        int file = sq & 7;
+        Bitboard attackers = 0ULL;
+        if (side == WHITE)
+        {
+            if (file < 7 && sq >= 9)
+                attackers |= (ONE << (sq - 9));
+            if (file > 0 && sq >= 7)
+                attackers |= (ONE << (sq - 7));
+        }
+        else
+        {
+            if (file < 7 && sq <= 56)
+                attackers |= (ONE << (sq + 7));
+            if (file > 0 && sq <= 54)
+                attackers |= (ONE << (sq + 9));
+        }
+        return attackers & pawns;
+    }
+
+    int promotedPieceIndex(Side side, uint8_t promo)
+    {
+        if (promo == PROMO_QUEEN)
+            return (side == WHITE) ? WQ : BQ;
+        if (promo == PROMO_ROOK)
+            return (side == WHITE) ? WR : BR;
+        if (promo == PROMO_BISHOP)
+            return (side == WHITE) ? WB : BB;
+        if (promo == PROMO_KNIGHT)
+            return (side == WHITE) ? WN : BN;
+        return -1;
+    }
+
+    Bitboard attackersToSq(
+        int sq,
+        Side side,
+        Bitboard occ,
+        const std::array<Bitboard, 12> &pieceBB)
+    {
+        if (side == WHITE)
+        {
+            Bitboard attackers = 0ULL;
+            attackers |= pawnAttackersTo(sq, WHITE, pieceBB[WP]);
+            attackers |= KNIGHT_ATTACKS[sq] & pieceBB[WN];
+            attackers |= bishopAttacks(sq, occ) & (pieceBB[WB] | pieceBB[WQ]);
+            attackers |= rookAttacks(sq, occ) & (pieceBB[WR] | pieceBB[WQ]);
+            attackers |= KING_ATTACKS[sq] & pieceBB[WK];
+            return attackers;
+        }
+        Bitboard attackers = 0ULL;
+        attackers |= pawnAttackersTo(sq, BLACK, pieceBB[BP]);
+        attackers |= KNIGHT_ATTACKS[sq] & pieceBB[BN];
+        attackers |= bishopAttacks(sq, occ) & (pieceBB[BB] | pieceBB[BQ]);
+        attackers |= rookAttacks(sq, occ) & (pieceBB[BR] | pieceBB[BQ]);
+        attackers |= KING_ATTACKS[sq] & pieceBB[BK];
+        return attackers;
+    }
+
+    bool leastValuableAttacker(
+        int sq,
+        Side side,
+        Bitboard occ,
+        const std::array<Bitboard, 12> &pieceBB,
+        int &pieceOut,
+        int &fromOut)
+    {
+        static constexpr int whiteOrder[6] = {WP, WN, WB, WR, WQ, WK};
+        static constexpr int blackOrder[6] = {BP, BN, BB, BR, BQ, BK};
+        const int *order = (side == WHITE) ? whiteOrder : blackOrder;
+        Bitboard allAttackers = attackersToSq(sq, side, occ, pieceBB);
+        if (!allAttackers)
+            return false;
+        for (int i = 0; i < 6; ++i)
+        {
+            int p = order[i];
+            Bitboard bb = allAttackers & pieceBB[p];
+            if (bb)
+            {
+                pieceOut = p;
+                fromOut = lsb(bb);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int staticExchangeEval(const Position &pos, const Move &m)
+    {
+        if (!m.isCapture && !m.isPromotion)
+            return 0;
+
+        Side us = pos.sideToMove;
+        Side them = (us == WHITE ? BLACK : WHITE);
+        int from = m.from;
+        int to = m.to;
+        if (from < 0 || from >= 64 || to < 0 || to >= 64)
+            return 0;
+
+        int movedPiece = pos.pieceIndexAt(from);
+        if (movedPiece < 0)
+            return 0;
+
+        int capturedSq = to;
+        int capturedPiece = pos.pieceIndexAt(to);
+        if (m.isCapture && capturedPiece < 0)
+        {
+            if ((movedPiece == WP || movedPiece == BP) && to == pos.enPassantSquare)
+            {
+                capturedSq = to + ((us == WHITE) ? -8 : 8);
+                capturedPiece = (us == WHITE) ? BP : WP;
+            }
+        }
+        if (capturedPiece < 0)
+            return 0;
+
+        std::array<Bitboard, 12> bb = pos.pieceBB;
+        Bitboard occ = pos.allPieces;
+        int gain[32]{};
+        int d = 0;
+        gain[0] = pieceValuesSee[capturedPiece];
+
+        int placedPiece = movedPiece;
+        if (m.isPromotion)
+        {
+            int promoPiece = promotedPieceIndex(us, m.promoPiece);
+            if (promoPiece >= 0)
+                placedPiece = promoPiece;
+        }
+        gain[0] += pieceValuesSee[placedPiece] - pieceValuesSee[movedPiece];
+
+        clear_bit(bb[movedPiece], from);
+        clear_bit(occ, from);
+        clear_bit(bb[capturedPiece], capturedSq);
+        clear_bit(occ, capturedSq);
+        set_bit(bb[placedPiece], to);
+        set_bit(occ, to);
+
+        Side stm = them;
+        int currentPieceOnTo = placedPiece;
+
+        while (true)
+        {
+            int attackerPiece = -1;
+            int attackerSq = -1;
+            if (!leastValuableAttacker(to, stm, occ, bb, attackerPiece, attackerSq))
+                break;
+            ++d;
+            if (d >= 31)
+                break;
+            gain[d] = pieceValuesSee[currentPieceOnTo] - gain[d - 1];
+
+            clear_bit(bb[attackerPiece], attackerSq);
+            clear_bit(occ, attackerSq);
+            clear_bit(bb[currentPieceOnTo], to);
+            set_bit(bb[attackerPiece], to);
+            set_bit(occ, to);
+
+            currentPieceOnTo = attackerPiece;
+            stm = (stm == WHITE ? BLACK : WHITE);
+        }
+
+        while (--d >= 0)
+            gain[d] = -std::max(-gain[d], gain[d + 1]);
+
+        return gain[0];
+    }
 }
 
 void TranspositionTable::resizeMB(int mb)
@@ -45,49 +249,115 @@ void TranspositionTable::resizeMB(int mb)
     if (mb <= 0)
         mb = 1;
     size_t bytes = static_cast<size_t>(mb) * 1024 * 1024;
-    size_t count = std::max<size_t>(1, bytes / sizeof(TTEntry));
+    size_t count = std::max<size_t>(1, bytes / sizeof(TTBucket));
     size_t pow2 = 1;
     while (pow2 < count)
         pow2 <<= 1;
     table.clear();
     table.resize(pow2);
     mask = pow2 - 1;
+    generation.store(1, std::memory_order_relaxed);
 }
 
 void TranspositionTable::clear()
 {
-    std::fill(table.begin(), table.end(), TTEntry{});
+    for (auto &bucket : table)
+    {
+        for (auto &entry : bucket.entries)
+            entry = TTEntry{};
+    }
+    generation.store(1, std::memory_order_relaxed);
+}
+
+void TranspositionTable::newSearch()
+{
+    generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool TranspositionTable::probe(uint64_t key, TTEntry &out) const
 {
     if (table.empty())
         return false;
-    const TTEntry &e = table[key & mask];
-    if (e.key == key)
+    const size_t index = static_cast<size_t>(key & mask);
+    const size_t lockIndex = index & (kLockStripes - 1);
+    std::lock_guard<std::mutex> guard(stripeLocks[lockIndex]);
+    const TTBucket &bucket = table[index];
+    bool found = false;
+    int bestDepth = -INF_SCORE;
+    for (const auto &e : bucket.entries)
     {
-        out = e;
-        return true;
+        if (e.key == key)
+        {
+            if (!found || e.depth > bestDepth)
+            {
+                found = true;
+                bestDepth = e.depth;
+                out = e;
+            }
+        }
     }
-    return false;
+    return found;
 }
 
 void TranspositionTable::store(uint64_t key, int depth, int score, uint8_t bound, const Move &bestMove)
 {
     if (table.empty())
         return;
-    TTEntry &e = table[key & mask];
-    if (e.key == key && e.depth > depth && bound != 0)
-        return;
-    e.key = key;
-    e.depth = depth;
-    e.score = score;
-    e.bound = bound;
-    e.bestMove = bestMove;
+    const size_t index = static_cast<size_t>(key & mask);
+    const size_t lockIndex = index & (kLockStripes - 1);
+    const uint8_t gen = static_cast<uint8_t>(generation.load(std::memory_order_relaxed));
+    std::lock_guard<std::mutex> guard(stripeLocks[lockIndex]);
+    TTBucket &bucket = table[index];
+
+    TTEntry *replace = &bucket.entries[0];
+    int replaceScore = INT_MAX;
+
+    for (auto &e : bucket.entries)
+    {
+        if (e.key == key)
+        {
+            if (e.depth > depth && e.bound == 3 && bound != 3)
+                return;
+            e.depth = depth;
+            e.score = score;
+            e.bound = bound;
+            e.generation = gen;
+            e.bestMove = bestMove;
+            return;
+        }
+
+        if (e.key == 0)
+        {
+            replace = &e;
+            replaceScore = INT_MIN;
+            break;
+        }
+
+        const int age = static_cast<int>((gen - e.generation) & 0xFF);
+        const int currentScore = e.depth - age * 2;
+        if (currentScore < replaceScore)
+        {
+            replaceScore = currentScore;
+            replace = &e;
+        }
+    }
+
+    replace->key = key;
+    replace->depth = depth;
+    replace->score = score;
+    replace->bound = bound;
+    replace->generation = gen;
+    replace->bestMove = bestMove;
 }
 
 struct SearchState
 {
+    struct EvalCacheEntry
+    {
+        uint64_t key = 0;
+        int score = 0;
+    };
+
     std::atomic<bool> *stopFlag = nullptr;
     TranspositionTable *tt = nullptr;
     uint64_t nodes = 0;
@@ -97,9 +367,16 @@ struct SearchState
     int softTimeLimitMs = 0;
     int maxDepth = 0;
     int nodeLimit = 0;
+    int contempt = 0;
+    Side rootSide = WHITE;
+    int workerId = 0;
     int killerMoves[MAX_PLY][2]{};
     int history[12][64]{};
+    int counterMoves[64][64]{};
+    int continuation[64][64]{};
+    int moveStack[MAX_PLY]{};
     std::vector<uint64_t> repHistory;
+    std::vector<EvalCacheEntry> evalCache;
 };
 
 struct NullUndo
@@ -109,7 +386,6 @@ struct NullUndo
     uint64_t prevHash = 0;
     int prevHalfmoveClock = 0;
     int prevFullmoveNumber = 1;
-    Nnue::Accumulator prevAccumulator{};
 };
 
 uint64_t totalNodes(const SearchState &st)
@@ -143,6 +419,30 @@ bool hasNonPawnMaterial(const Position &pos, Side side)
     return (pos.pieceBB[BN] | pos.pieceBB[BB] | pos.pieceBB[BR] | pos.pieceBB[BQ]) != 0ULL;
 }
 
+int drawScore(const Position &pos, const SearchState &st)
+{
+    if (st.contempt == 0)
+        return 0;
+    return (pos.sideToMove == st.rootSide) ? st.contempt : -st.contempt;
+}
+
+int evaluateCached(Position &pos, SearchState &st)
+{
+    if (st.evalCache.empty())
+        return evaluate(pos);
+
+    const uint64_t key = pos.hashKey;
+    const size_t idx = static_cast<size_t>(key) & (st.evalCache.size() - 1);
+    auto &entry = st.evalCache[idx];
+    if (entry.key == key)
+        return entry.score;
+
+    const int score = evaluate(pos);
+    entry.key = key;
+    entry.score = score;
+    return score;
+}
+
 void doNullMove(Position &pos, NullUndo &u)
 {
     u.prevSide = pos.sideToMove;
@@ -150,7 +450,6 @@ void doNullMove(Position &pos, NullUndo &u)
     u.prevHash = pos.hashKey;
     u.prevHalfmoveClock = pos.halfmoveClock;
     u.prevFullmoveNumber = pos.fullmoveNumber;
-    u.prevAccumulator = pos.nnueAccumulator;
 
     if (pos.enPassantSquare != -1)
     {
@@ -164,8 +463,7 @@ void doNullMove(Position &pos, NullUndo &u)
 
     pos.sideToMove = (pos.sideToMove == WHITE ? BLACK : WHITE);
     pos.hashKey ^= Zobrist::side();
-    if (pos.nnueAccumulator.initialized)
-        pos.nnueAccumulator.positionKey = pos.hashKey;
+    pos.nnueAccumulator.positionKey = pos.hashKey;
 }
 
 void undoNullMove(Position &pos, const NullUndo &u)
@@ -175,7 +473,7 @@ void undoNullMove(Position &pos, const NullUndo &u)
     pos.hashKey = u.prevHash;
     pos.halfmoveClock = u.prevHalfmoveClock;
     pos.fullmoveNumber = u.prevFullmoveNumber;
-    pos.nnueAccumulator = u.prevAccumulator;
+    pos.nnueAccumulator.positionKey = pos.hashKey;
 }
 
 bool castlePathSafe(const Position &pos, const Move &m, Side us, Side them)
@@ -223,13 +521,16 @@ int scoreMove(const Position &pos, const Move &m, const Move &ttMove, int ply, c
     if (sameMove(m, ttMove))
         return 1000000;
 
+    int id = moveId(m);
+
     if (m.isCapture)
     {
-        int captured = pos.pieceIndexAt(m.to);
+        Side us = pos.sideToMove;
+        int captured = capturedPieceAt(pos, m, us);
         int attacker = pos.pieceIndexAt(m.from);
         int victimVal = (captured >= 0) ? pieceValuesAbs[captured] : 100;
         int attackerVal = (attacker >= 0) ? pieceValuesAbs[attacker] : 100;
-        return 100000 + (victimVal * 10 - attackerVal);
+        return 100000 + (victimVal * 12 - attackerVal);
     }
 
     if (m.isPromotion)
@@ -237,15 +538,37 @@ int scoreMove(const Position &pos, const Move &m, const Move &ttMove, int ply, c
 
     int killer1 = st.killerMoves[ply][0];
     int killer2 = st.killerMoves[ply][1];
-    int moveId = (m.from << 6) | m.to;
-    if (moveId == killer1)
+    if (id == killer1)
         return 80000;
-    if (moveId == killer2)
+    if (id == killer2)
         return 70000;
+
+    if (ply > 0)
+    {
+        int prevId = st.moveStack[ply - 1];
+        if (prevId >= 0)
+        {
+            int prevFrom = (prevId >> 6) & 63;
+            int prevTo = prevId & 63;
+            int continuationBonus = st.continuation[prevTo][m.to] / 4;
+            if (st.counterMoves[prevFrom][prevTo] == id)
+                return 75000 + continuationBonus;
+            if (continuationBonus > 0)
+                return continuationBonus;
+        }
+    }
 
     int attacker = pos.pieceIndexAt(m.from);
     if (attacker >= 0)
-        return st.history[attacker][m.to];
+    {
+        int base = st.history[attacker][m.to];
+        if (st.workerId > 0 && ply == 0)
+        {
+            const int jitter = ((m.from * 17 + m.to * 13 + st.workerId * 23) & 15);
+            base += jitter;
+        }
+        return base;
+    }
 
     return 0;
 }
@@ -256,7 +579,7 @@ bool shouldStop(SearchState &st)
         return true;
     if (st.nodeLimit > 0 && (int)totalNodes(st) >= st.nodeLimit)
         return true;
-    if (st.hardTimeLimitMs > 0 && (totalNodes(st) & 4095) == 0)
+    if (st.hardTimeLimitMs > 0 && (totalNodes(st) & 1023) == 0)
     {
         if (elapsedMs(st) >= st.hardTimeLimitMs)
         {
@@ -274,11 +597,11 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
         return 0;
 
     if (ply >= MAX_PLY - 1)
-        return evaluate(pos);
+        return evaluateCached(pos, st);
 
     // 50-move rule draw.
     if (pos.halfmoveClock >= 100)
-        return 0;
+        return drawScore(pos, st);
 
     st.qnodes++;
 
@@ -287,27 +610,47 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
     int kingSq = pos.kingSquare[us];
     bool inCheck = (kingSq != -1) && pos.isSquareAttacked(kingSq, them);
 
-    int stand = evaluate(pos);
+    int stand = evaluateCached(pos, st);
     if (!inCheck)
     {
         if (stand >= beta)
-            return beta;
+            return stand;
         if (stand > alpha)
             alpha = stand;
+
+        // Delta pruning: if even the best plausible tactical swing cannot raise alpha,
+        // fail low immediately.
+        if (stand + pieceValuesAbs[WQ] + 160 < alpha)
+            return alpha;
     }
 
     MoveList moves;
     generateAllMoves(pos, moves);
-    std::vector<Move> moveVec = moves.moves;
+    struct ScoredMove
+    {
+        int score = 0;
+        Move move{};
+    };
+    std::array<ScoredMove, MoveList::MoveBuffer::kMaxMoves> moveVec{};
+    std::size_t moveCount = 0;
     Move emptyMove{};
-    std::sort(moveVec.begin(), moveVec.end(), [&](const Move &a, const Move &b)
-              { return scoreMove(pos, a, emptyMove, ply, st) > scoreMove(pos, b, emptyMove, ply, st); });
+    for (const auto &m : moves.moves)
+        moveVec[moveCount++] = {scoreMove(pos, m, emptyMove, ply, st), m};
+    std::sort(moveVec.begin(), moveVec.begin() + moveCount, [](const auto &a, const auto &b)
+              { return a.score > b.score; });
 
     int legalMoves = 0;
-    for (const auto &m : moveVec)
+    for (std::size_t i = 0; i < moveCount; ++i)
     {
+        const Move &m = moveVec[i].move;
         if (!inCheck && !(m.isCapture || m.isPromotion))
             continue;
+
+        if (!inCheck && m.isCapture && !m.isPromotion)
+        {
+            if (staticExchangeEval(pos, m) < 0)
+                continue;
+        }
 
         if (!inCheck && m.isCapture)
         {
@@ -334,7 +677,7 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
         pos.unmakeMove(m, u);
 
         if (score >= beta)
-            return beta;
+            return score;
         if (score > alpha)
             alpha = score;
     }
@@ -345,17 +688,17 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
     return alpha;
 }
 
-int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int ply)
+int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int ply, bool allowNullMove = true)
 {
     if (shouldStop(st))
         return 0;
 
     if (ply >= MAX_PLY - 1)
-        return evaluate(pos);
+        return evaluateCached(pos, st);
 
     // 50-move rule draw.
     if (pos.halfmoveClock >= 100)
-        return 0;
+        return drawScore(pos, st);
 
     st.nodes++;
     int alphaOrig = alpha;
@@ -385,7 +728,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         for (size_t i = 0; i + 1 < st.repHistory.size(); ++i)
         {
             if (st.repHistory[i] == key)
-                return 0;
+                return drawScore(pos, st);
         }
     }
 
@@ -406,13 +749,24 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         }
     }
 
+    // Internal iterative deepening: recover a useful TT move when ordering is empty.
+    if (pvNode && !inCheck && isNullMove(ttMove) && st.tt && depth >= 7)
+    {
+        (void)negamax(pos, st, depth - 2, alpha, beta, ply, allowNullMove);
+        if (shouldStop(st))
+            return 0;
+        TTEntry iid;
+        if (st.tt->probe(pos.hashKey, iid))
+            ttMove = iid.bestMove;
+    }
+
     int staticEval = INF_SCORE;
     bool haveStaticEval = false;
 
     // Reverse futility pruning for shallow, non-check, non-PV nodes.
     if (depth <= 3 && !pvNode && !inCheck)
     {
-        staticEval = evaluate(pos);
+        staticEval = evaluateCached(pos, st);
         haveStaticEval = true;
         int margin = 120 * depth + 60;
         if (staticEval - margin >= beta)
@@ -420,11 +774,11 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
     }
 
     // Null move pruning: try passing the move to prove a beta cutoff quickly.
-    if (depth >= 3 && !inCheck && ply > 0 && hasNonPawnMaterial(pos, us))
+    if (allowNullMove && depth >= 3 && !inCheck && ply > 0 && hasNonPawnMaterial(pos, us))
     {
         if (!haveStaticEval)
         {
-            staticEval = evaluate(pos);
+            staticEval = evaluateCached(pos, st);
             haveStaticEval = true;
         }
         if (staticEval >= beta)
@@ -433,7 +787,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
             NullUndo nu;
             doNullMove(pos, nu);
             st.repHistory.push_back(pos.hashKey);
-            int score = -negamax(pos, st, std::max(0, depth - 1 - reduction), -beta, -beta + 1, ply + 1);
+            int score = -negamax(pos, st, std::max(0, depth - 1 - reduction), -beta, -beta + 1, ply + 1, false);
             st.repHistory.pop_back();
             undoNullMove(pos, nu);
 
@@ -441,28 +795,60 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
                 return 0;
             if (score >= beta)
             {
+                if (depth >= 7)
+                {
+                    int verifyDepth = std::max(0, depth - 1 - reduction);
+                    int verify = negamax(pos, st, verifyDepth, beta - 1, beta, ply, false);
+                    if (shouldStop(st))
+                        return 0;
+                    if (verify < beta)
+                        goto skip_null_cutoff;
+                }
                 if (st.tt)
-                    st.tt->store(pos.hashKey, depth, scoreToTT(beta, ply), 2, Move{});
-                return beta;
+                    st.tt->store(pos.hashKey, depth, scoreToTT(score, ply), 2, Move{});
+                return score;
             }
+        skip_null_cutoff:
+            ;
         }
     }
 
     MoveList moves;
     generateAllMoves(pos, moves);
-    std::vector<Move> moveVec = moves.moves;
-    std::sort(moveVec.begin(), moveVec.end(), [&](const Move &a, const Move &b)
-              { return scoreMove(pos, a, ttMove, ply, st) > scoreMove(pos, b, ttMove, ply, st); });
+    struct ScoredMove
+    {
+        int score = 0;
+        Move move{};
+    };
+    std::array<ScoredMove, MoveList::MoveBuffer::kMaxMoves> moveVec{};
+    std::size_t moveCount = 0;
+    for (const auto &m : moves.moves)
+        moveVec[moveCount++] = {scoreMove(pos, m, ttMove, ply, st), m};
+    std::sort(moveVec.begin(), moveVec.begin() + moveCount, [](const auto &a, const auto &b)
+              { return a.score > b.score; });
 
     int bestScore = -INF_SCORE;
     Move bestMove{};
     int legalMoves = 0;
     bool searchedPvMove = false;
+    std::vector<std::pair<int, int>> quietTried;
+    quietTried.reserve(48);
 
-    for (const auto &m : moveVec)
+    for (std::size_t i = 0; i < moveCount; ++i)
     {
+        const Move &m = moveVec[i].move;
         if (!castlePathSafe(pos, m, us, them))
             continue;
+
+        int attackerFrom = pos.pieceIndexAt(m.from);
+        bool isQuiet = !m.isCapture && !m.isPromotion && !m.isCastle;
+        int see = 0;
+        bool haveSee = false;
+        if (m.isCapture && !m.isPromotion)
+        {
+            see = staticExchangeEval(pos, m);
+            haveSee = true;
+        }
 
         Undo u;
         pos.makeMove(m, u);
@@ -479,9 +865,9 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
             givesCheck = pos.isSquareAttacked(oppKingSq, us);
 
         // Late move pruning (LMP): skip very late quiets at low depth.
-        if (!pvNode && !inCheck && !givesCheck && depth <= 2 && !m.isCapture && !m.isPromotion && !m.isCastle)
+        if (!pvNode && !inCheck && !givesCheck && depth <= 3 && isQuiet)
         {
-            int lmpThreshold = 14 + 6 * depth; // depth1:20 depth2:26
+            int lmpThreshold = 12 + 8 * depth + depth * depth; // depth1:21 depth2:32 depth3:45
             if (legalMoves > lmpThreshold)
             {
                 pos.unmakeMove(m, u);
@@ -489,26 +875,64 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
             }
         }
 
+        if (!pvNode && !inCheck && !givesCheck && isQuiet && depth <= 3 && legalMoves > 1)
+        {
+            if (!haveStaticEval)
+            {
+                staticEval = evaluateCached(pos, st);
+                haveStaticEval = true;
+            }
+            int hist = (attackerFrom >= 0) ? st.history[attackerFrom][m.to] : 0;
+            int futilityMargin = 95 + 125 * depth;
+            if (hist > 3000)
+                futilityMargin += 80;
+            if (staticEval + futilityMargin <= alpha)
+            {
+                pos.unmakeMove(m, u);
+                continue;
+            }
+        }
+
         st.repHistory.push_back(pos.hashKey);
+        int prevMoveStack = st.moveStack[ply];
+        st.moveStack[ply] = moveId(m);
         int score = 0;
         int nextDepth = depth - 1;
 
-        bool lmrCandidate = !pvNode && !inCheck && !givesCheck && !m.isCapture && !m.isPromotion && !m.isCastle &&
+        if (!pvNode && !inCheck && !givesCheck && depth <= 3 && haveSee && see < -(95 * depth))
+        {
+            st.moveStack[ply] = prevMoveStack;
+            st.repHistory.pop_back();
+            pos.unmakeMove(m, u);
+            continue;
+        }
+
+        bool lmrCandidate = !pvNode && !inCheck && !givesCheck && isQuiet &&
                             depth >= 3 && legalMoves >= 4;
         if (lmrCandidate)
         {
             int reduction = 1;
-            if (depth >= 8)
+            if (depth >= 6)
                 reduction++;
+            if (legalMoves >= 8)
+                reduction++;
+            if (depth >= 10 && legalMoves >= 14)
+                reduction++;
+            int hist = (attackerFrom >= 0) ? st.history[attackerFrom][m.to] : 0;
+            if (hist > 6000)
+                reduction--;
+            else if (hist < -3000)
+                reduction++;
+            reduction = std::clamp(reduction, 1, std::max(1, nextDepth - 1));
             int reducedDepth = std::max(0, nextDepth - reduction);
 
-            score = -negamax(pos, st, reducedDepth, -alpha - 1, -alpha, ply + 1);
+            score = -negamax(pos, st, reducedDepth, -alpha - 1, -alpha, ply + 1, allowNullMove);
             if (score > alpha)
             {
-                score = -negamax(pos, st, nextDepth, -alpha - 1, -alpha, ply + 1);
+                score = -negamax(pos, st, nextDepth, -alpha - 1, -alpha, ply + 1, allowNullMove);
                 if (score > alpha && score < beta)
                 {
-                    score = -negamax(pos, st, nextDepth, -beta, -alpha, ply + 1);
+                    score = -negamax(pos, st, nextDepth, -beta, -alpha, ply + 1, allowNullMove);
                 }
             }
         }
@@ -516,17 +940,18 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         {
             if (!searchedPvMove)
             {
-                score = -negamax(pos, st, nextDepth, -beta, -alpha, ply + 1);
+                score = -negamax(pos, st, nextDepth, -beta, -alpha, ply + 1, allowNullMove);
             }
             else
             {
-                score = -negamax(pos, st, nextDepth, -alpha - 1, -alpha, ply + 1);
+                score = -negamax(pos, st, nextDepth, -alpha - 1, -alpha, ply + 1, allowNullMove);
                 if (score > alpha && score < beta)
                 {
-                    score = -negamax(pos, st, nextDepth, -beta, -alpha, ply + 1);
+                    score = -negamax(pos, st, nextDepth, -beta, -alpha, ply + 1, allowNullMove);
                 }
             }
         }
+        st.moveStack[ply] = prevMoveStack;
         st.repHistory.pop_back();
         pos.unmakeMove(m, u);
         searchedPvMove = true;
@@ -545,42 +970,66 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         }
         if (alpha >= beta)
         {
-            if (!m.isCapture)
+            if (isQuiet)
             {
-                int moveId = (m.from << 6) | m.to;
+                int id = moveId(m);
+                int bonus = depth * depth + depth * 2;
                 st.killerMoves[ply][1] = st.killerMoves[ply][0];
-                st.killerMoves[ply][0] = moveId;
-                int attacker = pos.pieceIndexAt(m.from);
-                if (attacker >= 0)
+                st.killerMoves[ply][0] = id;
+                if (attackerFrom >= 0)
                 {
-                    st.history[attacker][m.to] += depth * depth;
-                    if (st.history[attacker][m.to] > 32767)
-                        st.history[attacker][m.to] = 32767;
+                    updateHistory(st.history[attackerFrom][m.to], bonus);
+                    for (const auto &q : quietTried)
+                        updateHistory(st.history[q.first][q.second], -bonus);
+                }
+                if (ply > 0)
+                {
+                    int prevId = st.moveStack[ply - 1];
+                    if (prevId >= 0)
+                    {
+                        int prevFrom = (prevId >> 6) & 63;
+                        int prevTo = prevId & 63;
+                        st.counterMoves[prevFrom][prevTo] = id;
+                        updateHistory(st.continuation[prevTo][m.to], bonus);
+                        for (const auto &q : quietTried)
+                            updateHistory(st.continuation[prevTo][q.second], -bonus);
+                    }
                 }
             }
             if (st.tt)
-                st.tt->store(pos.hashKey, depth, scoreToTT(beta, ply), 2, m);
-            return beta;
+                st.tt->store(pos.hashKey, depth, scoreToTT(score, ply), 2, m);
+            return score;
         }
+
+        if (isQuiet && attackerFrom >= 0)
+            quietTried.push_back({attackerFrom, m.to});
     }
 
     if (legalMoves == 0)
     {
         if (inCheck)
             return -MATE_SCORE + ply;
-        return 0;
+        return drawScore(pos, st);
     }
 
     uint8_t bound = 3;
     if (bestScore <= alphaOrig)
         bound = 1;
+
+    if (bound != 1 && !bestMove.isCapture && !bestMove.isPromotion && !bestMove.isCastle)
+    {
+        int attacker = pos.pieceIndexAt(bestMove.from);
+        if (attacker >= 0)
+            updateHistory(st.history[attacker][bestMove.to], depth);
+    }
+
     if (st.tt)
         st.tt->store(pos.hashKey, depth, scoreToTT(bestScore, ply), bound, bestMove);
 
     return bestScore;
 }
 
-SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTable &tt, std::atomic<bool> &stopFlag)
+SearchResult searchSingle(Position &pos, const SearchLimits &limits, TranspositionTable &tt, std::atomic<bool> &stopFlag, int workerId)
 {
     SearchState st;
     st.stopFlag = &stopFlag;
@@ -589,17 +1038,254 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     st.qnodes = 0;
     st.start = std::chrono::steady_clock::now();
     st.hardTimeLimitMs = limits.movetimeMs;
-    st.softTimeLimitMs = (limits.movetimeMs > 0) ? (limits.movetimeMs * 7) / 10 : 0;
+    st.softTimeLimitMs = (limits.movetimeMs > 0) ? (limits.movetimeMs * 95) / 100 : 0;
     st.maxDepth = limits.depth;
     st.nodeLimit = limits.nodes;
+    st.contempt = limits.contempt;
+    st.rootSide = pos.sideToMove;
+    st.workerId = workerId;
+    st.evalCache.assign(1u << 15, SearchState::EvalCacheEntry{});
     st.repHistory.clear();
     st.repHistory.push_back(pos.hashKey);
+    std::fill(std::begin(st.moveStack), std::end(st.moveStack), -1);
+    for (int from = 0; from < 64; ++from)
+    {
+        for (int to = 0; to < 64; ++to)
+            st.counterMoves[from][to] = -1;
+    }
 
     SearchResult result;
     result.bestMove = Move{};
     result.score = 0;
     result.depth = 0;
     int lastScore = 0;
+
+    MoveList rootLegal;
+    generateLegalMoves(pos, rootLegal);
+    if (rootLegal.moves.empty())
+    {
+        Side us = pos.sideToMove;
+        Side them = (us == WHITE) ? BLACK : WHITE;
+        bool inCheck = (pos.kingSquare[us] != -1) && pos.isSquareAttacked(pos.kingSquare[us], them);
+        result.score = inCheck ? -MATE_SCORE : drawScore(pos, st);
+        return result;
+    }
+
+    struct RootMoveEntry
+    {
+        Move move{};
+        int score = 0;
+    };
+    std::vector<RootMoveEntry> rootMoves;
+    rootMoves.reserve(rootLegal.moves.size());
+    for (const auto &m : rootLegal.moves)
+        rootMoves.push_back({m, 0});
+
+    TTEntry rootTte;
+    if (tt.probe(pos.hashKey, rootTte) && !isNullMove(rootTte.bestMove))
+    {
+        for (auto &rm : rootMoves)
+        {
+            if (sameMove(rm.move, rootTte.bestMove))
+            {
+                rm.score = 1000000;
+                break;
+            }
+        }
+        std::stable_sort(rootMoves.begin(), rootMoves.end(), [](const RootMoveEntry &a, const RootMoveEntry &b)
+                         { return a.score > b.score; });
+    }
+
+    if (workerId > 0)
+    {
+        for (auto &rm : rootMoves)
+        {
+            const int jitter = ((rm.move.from * 31 + rm.move.to * 7 + rm.move.promoPiece * 19 + workerId * 29) & 31);
+            rm.score += jitter;
+        }
+        std::stable_sort(rootMoves.begin(), rootMoves.end(), [](const RootMoveEntry &a, const RootMoveEntry &b)
+                         { return a.score > b.score; });
+    }
+
+    auto rootSearch = [&](int depth, int alpha, int beta, Move &bestMoveOut, int &bestScoreOut) -> bool
+    {
+        Side us = pos.sideToMove;
+        Side them = (us == WHITE ? BLACK : WHITE);
+
+        const int requestedThreads = std::max(1, limits.threads);
+        const bool useParallelRoot = requestedThreads > 1 && rootMoves.size() > 1 && depth > 1;
+
+        if (useParallelRoot)
+        {
+            std::atomic<size_t> nextIndex{0};
+            std::vector<int> moveScores(rootMoves.size(), -INF_SCORE);
+            std::vector<char> moveSearched(rootMoves.size(), 0);
+            std::vector<uint64_t> workerNodes(requestedThreads, 0);
+            std::vector<uint64_t> workerQnodes(requestedThreads, 0);
+
+            auto worker = [&](int workerId)
+            {
+                while (true)
+                {
+                    if (stopFlag.load(std::memory_order_relaxed))
+                        break;
+                    const size_t idx = nextIndex.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= rootMoves.size())
+                        break;
+
+                    const Move m = rootMoves[idx].move;
+                    Position childPos = pos;
+                    if (!castlePathSafe(childPos, m, us, them))
+                        continue;
+
+                    Undo u;
+                    childPos.makeMove(m, u);
+                    if (childPos.isSquareAttacked(childPos.kingSquare[us], them))
+                    {
+                        childPos.unmakeMove(m, u);
+                        continue;
+                    }
+
+                    SearchState child = st;
+                    child.nodes = 0;
+                    child.qnodes = 0;
+                    child.tt = nullptr; // Avoid TT races in root-split mode.
+                    child.nodeLimit = 0;
+                    child.repHistory = st.repHistory;
+                    child.repHistory.push_back(childPos.hashKey);
+                    child.moveStack[0] = moveId(m);
+
+                    int score = -negamax(childPos, child, depth - 1, -beta, -alpha, 1);
+                    childPos.unmakeMove(m, u);
+
+                    workerNodes[workerId] += child.nodes;
+                    workerQnodes[workerId] += child.qnodes;
+
+                    if (stopFlag.load(std::memory_order_relaxed))
+                        break;
+
+                    moveScores[idx] = score;
+                    moveSearched[idx] = 1;
+                }
+            };
+
+            const int numWorkers = std::min<int>(requestedThreads, static_cast<int>(rootMoves.size()));
+            std::vector<std::thread> workers;
+            workers.reserve(numWorkers);
+            for (int i = 0; i < numWorkers; ++i)
+                workers.emplace_back(worker, i);
+            for (auto &t : workers)
+                t.join();
+
+            for (int i = 0; i < numWorkers; ++i)
+            {
+                st.nodes += workerNodes[i];
+                st.qnodes += workerQnodes[i];
+            }
+
+            if (shouldStop(st))
+                return false;
+
+            int bestScore = -INF_SCORE;
+            Move bestMove{};
+            bool searchedAny = false;
+            for (size_t i = 0; i < rootMoves.size(); ++i)
+            {
+                if (!moveSearched[i])
+                    continue;
+                searchedAny = true;
+                rootMoves[i].score = moveScores[i];
+                if (moveScores[i] > bestScore)
+                {
+                    bestScore = moveScores[i];
+                    bestMove = rootMoves[i].move;
+                }
+            }
+
+            if (!searchedAny)
+            {
+                bestMoveOut = Move{};
+                bestScoreOut = 0;
+                return true;
+            }
+
+            bestMoveOut = bestMove;
+            bestScoreOut = bestScore;
+            std::stable_sort(rootMoves.begin(), rootMoves.end(), [](const RootMoveEntry &a, const RootMoveEntry &b)
+                             { return a.score > b.score; });
+            return true;
+        }
+
+        int localAlpha = alpha;
+        int bestScore = -INF_SCORE;
+        Move bestMove{};
+        bool searchedAny = false;
+        bool searchedPvMove = false;
+
+        for (auto &rm : rootMoves)
+        {
+            const Move &m = rm.move;
+            if (!castlePathSafe(pos, m, us, them))
+                continue;
+
+            Undo u;
+            pos.makeMove(m, u);
+            if (pos.isSquareAttacked(pos.kingSquare[us], them))
+            {
+                pos.unmakeMove(m, u);
+                continue;
+            }
+
+            searchedAny = true;
+            st.repHistory.push_back(pos.hashKey);
+            int prevMoveStack = st.moveStack[0];
+            st.moveStack[0] = moveId(m);
+
+            int score = 0;
+            if (!searchedPvMove)
+            {
+                score = -negamax(pos, st, depth - 1, -beta, -localAlpha, 1);
+            }
+            else
+            {
+                score = -negamax(pos, st, depth - 1, -localAlpha - 1, -localAlpha, 1);
+                if (score > localAlpha && score < beta)
+                    score = -negamax(pos, st, depth - 1, -beta, -localAlpha, 1);
+            }
+
+            st.moveStack[0] = prevMoveStack;
+            st.repHistory.pop_back();
+            pos.unmakeMove(m, u);
+            searchedPvMove = true;
+
+            if (shouldStop(st))
+                return false;
+
+            rm.score = score;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestMove = m;
+            }
+            if (score > localAlpha)
+                localAlpha = score;
+            if (localAlpha >= beta)
+                break;
+        }
+
+        if (!searchedAny)
+        {
+            bestMoveOut = Move{};
+            bestScoreOut = 0;
+            return true;
+        }
+
+        bestMoveOut = bestMove;
+        bestScoreOut = bestScore;
+        std::stable_sort(rootMoves.begin(), rootMoves.end(), [](const RootMoveEntry &a, const RootMoveEntry &b)
+                         { return a.score > b.score; });
+        return true;
+    };
 
     int maxDepth = (limits.depth > 0) ? limits.depth : 64;
     for (int d = 1; d <= maxDepth; ++d)
@@ -612,6 +1298,7 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
         int beta = INF_SCORE;
         int window = 25;
         int reSearches = 0;
+        Move depthBestMove = result.bestMove;
 
         if (d >= 4)
         {
@@ -621,7 +1308,12 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
 
         while (true)
         {
-            score = negamax(pos, st, d, alpha, beta, 0);
+            Move trialBestMove{};
+            int trialScore = 0;
+            if (!rootSearch(d, alpha, beta, trialBestMove, trialScore))
+                break;
+            score = trialScore;
+            depthBestMove = trialBestMove;
             if (shouldStop(st))
                 break;
 
@@ -654,6 +1346,7 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
         if (shouldStop(st))
             break;
 
+        result.bestMove = depthBestMove;
         result.score = score;
         result.depth = d;
         result.nodes = st.nodes;
@@ -663,9 +1356,7 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
         if ((d % 4) == 0)
             decayHistory(st);
 
-        TTEntry tte;
-        if (tt.probe(pos.hashKey, tte))
-            result.bestMove = tte.bestMove;
+        tt.store(pos.hashKey, d, scoreToTT(score, 0), 3, result.bestMove);
 
         int elapsed = elapsedMs(st);
         uint64_t allNodes = totalNodes(st);
@@ -695,4 +1386,53 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     }
 
     return result;
+}
+
+SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTable &tt, std::atomic<bool> &stopFlag)
+{
+    tt.newSearch();
+
+    SearchLimits singleLimits = limits;
+    singleLimits.threads = 1;
+
+    int threadCount = std::max(1, limits.threads);
+    const unsigned hw = std::thread::hardware_concurrency();
+    if (hw > 0)
+        threadCount = std::min(threadCount, static_cast<int>(hw));
+    threadCount = std::min(threadCount, 32);
+
+    if (threadCount <= 1)
+        return searchSingle(pos, singleLimits, tt, stopFlag, 0);
+
+    std::vector<SearchResult> workerResults(threadCount);
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount - 1);
+
+    auto workerFn = [&](int workerId)
+    {
+        Position localPos = pos;
+        SearchLimits localLimits = singleLimits;
+        localLimits.printInfo = (workerId == 0) ? limits.printInfo : false;
+        workerResults[workerId] = searchSingle(localPos, localLimits, tt, stopFlag, workerId);
+    };
+
+    for (int id = 1; id < threadCount; ++id)
+        workers.emplace_back(workerFn, id);
+    workerFn(0);
+    for (auto &w : workers)
+        w.join();
+
+    SearchResult best = workerResults[0];
+    uint64_t totalNodes = 0;
+    uint64_t totalQnodes = 0;
+    for (const auto &r : workerResults)
+    {
+        totalNodes += r.nodes;
+        totalQnodes += r.qnodes;
+        if (r.depth > best.depth || (r.depth == best.depth && r.score > best.score))
+            best = r;
+    }
+    best.nodes = totalNodes;
+    best.qnodes = totalQnodes;
+    return best;
 }
