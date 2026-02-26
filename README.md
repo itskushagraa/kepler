@@ -14,17 +14,8 @@
 
 ## Why Kepler?
 
-I wanted something I could understand end‑to‑end. So I built it from scratch, one subsystem at a time.  
-The goal is to keep it **measurable**, **hackable**, and easy to iterate on.
-
----
-
-## Highlights
-
-- NNUE evaluation (HalfKP) with fast incremental updates
-- Search improvements (move ordering, LMR/QS tweaks, heuristics)
-- Teacher‑data workflow with filtering + curation
-- Gauntlet harness for controlled Elo estimation
+I wanted something I could understand end‑to‑end. So I built it from scratch.
+The goal is an estimated playing strength of 3000+ elo, although I'm currently limited to 1 GPU, which restricts the scale of training, dataset size, and architectural experiments I can run.
 
 ---
 
@@ -56,7 +47,7 @@ go movetime 1000
 
 ---
 
-## NNUE Workflow (End-to-End)
+## NNUE Workflow
 
 ### 1) Generate Teacher Data
 
@@ -67,14 +58,14 @@ python3 tools/nnue_cycle.py \
   --games 200 \
   --movetime 20 \
   --datagen-mode teacher \
-  --teacher-play-elo 3000 \
+  --teacher-play-elo 3190 \
   --teacher-label-elo 0 \
   --filter-min-ply 20 \
   --filter-max-ply 60 \
   --filter-max-abs-score-cp 200
 ```
 
-### 2) Train NNUE
+### 2) Train NNUE (this will take a LONG time depending on what params you set for the step above)
 
 ```bash
 python3 tools/train_bootstrap_nnue.py \
@@ -89,7 +80,7 @@ python3 tools/train_bootstrap_nnue.py \
   --epochs 80
 ```
 
-### 3) Evaluate in Gauntlet
+### 3) Evaluate in Gauntlet (against stockfish)
 
 ```bash
 python3 tools/rated_gauntlet.py \
@@ -114,8 +105,6 @@ result<TAB>score<TAB>fen<TAB>...metadata
 
 Metadata columns (when enabled) include ply, score bucket, opening ID, and termination reason.  
 Training ignores extra columns after FEN.
-
----
 
 ---
 
@@ -144,15 +133,16 @@ Key scripts:
 
 ## Motivation
 
-I like playing chess, and I love ML + algorithms, so I decided to build a chess engine from scratch and see how far I could push it.
+I like playing chess; I love Machine Learning and algorithm analysis/design, so I decided to build a chess engine from scratch and see how far I could push it.
 
 ## Current Strength (WIP)
 
-Right now Kepler sits around the **~2000 Elo** range in my internal gauntlets (e.g., estimated ~2038 in controlled Stockfish‑based testing).  
-It’s always evolving as I train new nets and tweak search, but I’m limited by **one GPU** so training throughput isn’t infinite.
+Right now Kepler sits around the **~2000 Elo** range in my internal gauntlets (estimated ~2038 in controlled Stockfish‑based testing).  
+It’s always evolving as I train new nets and tweak search, but I’m limited by **one GPU** so training throughput isn’t that high.
 
 ---
 
 ## Disclaimer
 
-This is a personal research project, so expect rough edges. I’m iterating fast and breaking things often.
+- This is a personal research project, so expect rough edges. I’m iterating fast and breaking things often.
+- Using this on sites like lichess and chess.com WILL get you banned and is discouraged.
