@@ -1,5 +1,6 @@
 #include "search.hpp"
 #include "eval.hpp"
+#include "tb.hpp"
 #include "zobrist.hpp"
 #include <algorithm>
 #include <array>
@@ -107,6 +108,23 @@ namespace
         if (promo == PROMO_KNIGHT)
             return (side == WHITE) ? WN : BN;
         return -1;
+    }
+
+    bool tryTablebaseProbe(Position &pos, int depth, int ply, int &scoreOut)
+    {
+        if (!TB::isEnabled())
+            return false;
+        if (depth < TB::probeDepth())
+            return false;
+        int tbScore = 0;
+        if (!TB::probeWDL(pos, tbScore))
+            return false;
+        if (tbScore > 0)
+            tbScore = std::min(tbScore, MATE_SCORE - ply - 1);
+        else if (tbScore < 0)
+            tbScore = std::max(tbScore, -MATE_SCORE + ply + 1);
+        scoreOut = tbScore;
+        return true;
     }
 
     Bitboard attackersToSq(
@@ -603,6 +621,10 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
     if (pos.halfmoveClock >= 100)
         return drawScore(pos, st);
 
+    int tbScore = 0;
+    if (tryTablebaseProbe(pos, 1, ply, tbScore))
+        return tbScore;
+
     st.qnodes++;
 
     Side us = pos.sideToMove;
@@ -731,6 +753,10 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
                 return drawScore(pos, st);
         }
     }
+
+    int tbScore = 0;
+    if (tryTablebaseProbe(pos, depth, ply, tbScore))
+        return tbScore;
 
     TTEntry tte;
     Move ttMove{};

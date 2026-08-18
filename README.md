@@ -28,6 +28,15 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 cmake --build build-release -j
 ```
 
+Run the move-generation regression suite:
+
+```bash
+./build-release/perft
+```
+
+It contains the six standard ChessProgramming.org positions and prints depths
+1–5 for each. The target is standalone and does not depend on search or UCI.
+
 ### Run (UCI)
 
 ```bash
@@ -44,6 +53,9 @@ setoption name EvalFile value models/kepler_baseline_pst_v1.nnue
 position startpos
 go movetime 1000
 ```
+
+Syzygy probing is optional. Place Fathom’s `tbprobe.h` and `tbprobe.c` under
+`external/fathom/`, then configure with `-DKEPLER_SYZYGY=ON`.
 
 ---
 
@@ -111,11 +123,10 @@ Training ignores extra columns after FEN.
 ## Project Structure
 
 ```
-src/        Engine core (search, eval, UCI, NNUE runtime)
-include/    Headers
+src/        Engine core and headers (move generation, search, eval, UCI, NNUE)
 tools/      Data generation, training, curation, gauntlets
 models/     Baseline NNUE files
-tests/      Perft + engine validation
+tests/      Move-generation/perft regression suite
 ```
 
 ---
@@ -135,14 +146,22 @@ Key scripts:
 
 I like playing chess; I love Machine Learning and algorithm analysis/design, so I decided to build a chess engine from scratch and see how far I could push it.
 
-## Current Strength (WIP)
+## Development Status
 
-Right now Kepler sits around the **~2000 Elo** range in my internal gauntlets (estimated ~2038 in controlled Stockfish‑based testing).  
-It’s always evolving as I train new nets and tweak search, but I’m limited by **one GPU** so training throughput isn’t that high.
+Kepler is usable for UCI analysis and self-play, with legal move generation,
+alpha-beta search, classical evaluation, optional NNUE evaluation, and a NNUE
+data/training workflow. Historical internal gauntlets reported roughly
+1800–2000 Elo; that is not a current benchmark and should be refreshed.
+
+The active development areas are search strength, evaluation tuning,
+training-data quality, and optional Syzygy support. Perft is the primary
+correctness guardrail for position and move-generation changes.
 
 ---
 
 ## Disclaimer
 
-- This is a personal research project, so expect rough edges. I’m iterating fast and breaking things often.
-- Using this on sites like lichess and chess.com WILL get you banned and is discouraged.
+This is a personal research project. Keep generated builds and training output
+outside version control, and run perft after position or move-generation edits.
+Using this on sites like lichess and chess.com can result in a ban and is
+discouraged.

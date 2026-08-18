@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(Kepler LANGUAGES CXX)
+project(Kepler LANGUAGES C CXX)
 include(CheckIPOSupported)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -9,13 +9,50 @@ if(KEPLER_IPO_SUPPORTED)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 endif()
 
-file(GLOB SRC_FILES src/*.cpp)
-list(REMOVE_ITEM SRC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/nnue_tool.cpp")
-add_executable(kepler ${SRC_FILES})
-target_include_directories(kepler PRIVATE include)
+option(KEPLER_SYZYGY "Enable Syzygy tablebase probing (requires fathom source)" OFF)
 
-add_executable(perft tests/perft.cpp src/position.cpp src/movegen.cpp src/eval.cpp src/search.cpp src/uci.cpp src/zobrist.cpp src/nnue.cpp src/datagen.cpp)
-target_include_directories(perft PRIVATE include src)
+set(KEPLER_SOURCES
+    src/main.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/search.cpp
+    src/uci.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+    src/datagen.cpp
+    src/tb.cpp
+)
+
+if(KEPLER_SYZYGY)
+    find_path(FATHOM_INCLUDE_DIR tbprobe.h
+        PATHS "${CMAKE_CURRENT_SOURCE_DIR}/external/fathom"
+        NO_DEFAULT_PATH)
+    find_file(FATHOM_SOURCE tbprobe.c
+        PATHS "${CMAKE_CURRENT_SOURCE_DIR}/external/fathom"
+        NO_DEFAULT_PATH)
+    if(NOT FATHOM_INCLUDE_DIR OR NOT FATHOM_SOURCE)
+        message(FATAL_ERROR
+            "KEPLER_SYZYGY=ON requires external/fathom/tbprobe.h and tbprobe.c")
+    endif()
+    list(APPEND KEPLER_SOURCES "${FATHOM_SOURCE}")
+endif()
+
+add_executable(kepler ${KEPLER_SOURCES})
+target_include_directories(kepler PRIVATE src)
+if(KEPLER_SYZYGY)
+    target_compile_definitions(kepler PRIVATE KEPLER_SYZYGY)
+    target_include_directories(kepler PRIVATE "${FATHOM_INCLUDE_DIR}")
+endif()
+
+add_executable(perft
+    tests/perft.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+)
+target_include_directories(perft PRIVATE src)
 
 add_executable(nnue_tool src/nnue_tool.cpp)
-target_include_directories(nnue_tool PRIVATE include src)
+target_include_directories(nnue_tool PRIVATE src)

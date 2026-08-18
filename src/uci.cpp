@@ -17,6 +17,7 @@
 #include "search.hpp"
 #include "nnue.hpp"
 #include "eval.hpp"
+#include "tb.hpp"
 
 namespace
 {
@@ -212,6 +213,9 @@ void runUciLoop()
             std::cout << "option name EvalFile type string default <empty>\n";
             std::cout << "option name BaselineEvalFile type string default " << kDefaultBaselineEvalFile << "\n";
             std::cout << "option name UseBaseline type check default true\n";
+            std::cout << "option name SyzygyPath type string default <empty>\n";
+            std::cout << "option name SyzygyProbeDepth type spin default 1 min 1 max 64\n";
+            std::cout << "option name SyzygyProbeLimit type spin default 6 min 0 max 7\n";
             std::cout << "uciok\n";
         }
         else if (cmd == "isready")
@@ -282,6 +286,36 @@ void runUciLoop()
             else if (name == "EvalFile")
             {
                 loadEvalFile(value);
+            }
+            else if (name == "SyzygyPath")
+            {
+                TB::setPath(value);
+            }
+            else if (name == "SyzygyProbeDepth")
+            {
+                int d = 1;
+                try
+                {
+                    d = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    d = TB::probeDepth();
+                }
+                TB::setProbeDepth(d);
+            }
+            else if (name == "SyzygyProbeLimit")
+            {
+                int p = 6;
+                try
+                {
+                    p = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                    p = TB::probeLimit();
+                }
+                TB::setProbeLimit(p);
             }
             else if (name == "BaselineEvalFile")
             {
