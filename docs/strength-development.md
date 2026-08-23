@@ -35,6 +35,39 @@ much weaker with queens present (54.5 cp average loss) than without queens
 estimate, but it points to middlegame/opening search and evaluation as the
 largest current weakness.
 
+## NixOS development environments
+
+The repository pins Nixpkgs in `flake.lock` and provides two shells:
+
+```bash
+nix develop          # C++ toolchain, Python tooling, and Stockfish 18
+nix develop .#cuda   # the same tools plus sm_86 CUDA, nvcc, and CUDA PyTorch
+```
+
+The CUDA shell targets the RTX 3070's compute capability 8.6 without enabling
+CUDA globally for every Nixpkgs package. On a multi-user Nix installation,
+configure `https://cache.nixos-cuda.org` and its public key in the system Nix
+settings before realizing the shell. Otherwise Nix may attempt a very large
+local PyTorch/CUDA build.
+
+Verify actual GPU execution, not merely the presence of `nvcc`:
+
+```bash
+nix develop .#cuda
+nvidia-smi
+nvcc --version
+python3 - <<'PY'
+import torch
+
+assert torch.cuda.is_available()
+assert torch.cuda.get_device_capability(0) == (8, 6)
+x = torch.randn(2048, 2048, device="cuda")
+y = x @ x
+torch.cuda.synchronize()
+print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), y.norm().item())
+PY
+```
+
 ## 0. Establish a clean tested binary
 
 ```bash
@@ -51,12 +84,15 @@ engine and model SHA-256 hashes for this reason.
 ## 1. Generate a promotion-scale teacher corpus
 
 ```bash
-caffeinate -i python3 tools/generate_teacher_shards.py \
+systemd-inhibit --what=sleep --mode=block \
+  --why="Kepler teacher dataset generation" \
+  python3 tools/generate_teacher_shards.py \
   --engine build-release/kepler \
-  --stockfish /opt/homebrew/bin/stockfish \
-  --out-dir /private/tmp/kepler-strength-data-v1 \
+  --stockfish "$(command -v stockfish)" \
+  --out-dir "$HOME/kepler-data/kepler-strength-data-v1" \
   --games 24000 \
   --games-per-shard 500 \
+  --workers BENCHMARKED_WORKER_COUNT \
   --label-nodes 20000 \
   --curated-rows 1000000
 ```
@@ -73,16 +109,43 @@ only for smoke tests.
 
 ## 2. Train matched H128 and H256 candidates
 
+Start with FP32. Enable `--amp` only after the FP32 CUDA smoke and parity tests
+pass. The feature table is a sparse PyTorch embedding, so each batch gathers
+and updates only active HalfKP rows. The NumPy backend remains available with
+`--backend numpy --device cpu` and is the default when no backend is supplied.
+
 ```bash
-caffeinate -i python3 tools/train_strength_models.py \
-  --dataset-dir /private/tmp/kepler-strength-data-v1/curated \
-  --out-dir /private/tmp/kepler-strength-models-v1 \
+systemd-inhibit --what=sleep --mode=block \
+  --why="Kepler CUDA NNUE training" \
+  python3 tools/train_strength_models.py \
+  --dataset-dir "$HOME/kepler-data/kepler-strength-data-v1/curated" \
+  --out-dir "$HOME/kepler-data/kepler-strength-models-v1" \
+  --backend torch \
+  --device cuda \
   --epochs 80 \
-  --batch-size 256 \
+  --batch-size BENCHMARKED_GPU_BATCH \
   --result-weight 0.15 \
   --target-clip 2000 \
-  --wdl-cp 600
+  --wdl-cp 600 \
+  --checkpoint-dir "$HOME/kepler-data/kepler-strength-checkpoints-v1"
 ```
+
+Each completed epoch is written atomically. To resume both model sizes, point
+the wrapper at the checkpoint root; it selects `h128/latest.pt` and
+`h256/latest.pt` independently:
+
+```bash
+python3 tools/train_strength_models.py \
+  --dataset-dir "$HOME/kepler-data/kepler-strength-data-v1/curated" \
+  --out-dir "$HOME/kepler-data/kepler-strength-models-v1" \
+  --backend torch --device cuda --epochs 80 \
+  --checkpoint-dir "$HOME/kepler-data/kepler-strength-checkpoints-v1" \
+  --resume-checkpoint "$HOME/kepler-data/kepler-strength-checkpoints-v1"
+```
+
+Metrics and checkpoints record dataset hashes, Git and flake revisions,
+backend, device, GPU, CUDA/PyTorch versions, seed, optimizers, batch size,
+best epoch, and validation history.
 
 The trainer keeps teacher values in centipawns, blends in game outcome on the
 same scale, restores the best held-out epoch, reports errors by phase,
@@ -90,8 +153,8 @@ material and result, and rejects undersized or game-leaking data. Both model
 files must load and pass incremental-accumulator validation:
 
 ```bash
-./build-release/eval_consistency /private/tmp/kepler-strength-models-v1/halfkp_h128.nnue
-./build-release/eval_consistency /private/tmp/kepler-strength-models-v1/halfkp_h256.nnue
+./build-release/eval_consistency "$HOME/kepler-data/kepler-strength-models-v1/halfkp_h128.nnue"
+./build-release/eval_consistency "$HOME/kepler-data/kepler-strength-models-v1/halfkp_h256.nnue"
 ```
 
 ## 3. Calibrate each candidate statically
@@ -99,12 +162,12 @@ files must load and pass incremental-accumulator validation:
 ```bash
 python3 tools/tune_eval_blend.py \
   --engine build-release/kepler \
-  --model /private/tmp/kepler-strength-models-v1/halfkp_h128.nnue \
-  --data /private/tmp/kepler-strength-data-v1/curated/validation.tsv \
+  --model "$HOME/kepler-data/kepler-strength-models-v1/halfkp_h128.nnue" \
+  --data "$HOME/kepler-data/kepler-strength-data-v1/curated/validation.tsv" \
   --positions 2000 \
   --weights 25,50,75,100 \
   --clamps 0,150,300,600 \
-  --json-out /private/tmp/kepler-strength-models-v1/h128-blend-grid.json
+  --json-out "$HOME/kepler-data/kepler-strength-models-v1/h128-blend-grid.json"
 ```
 
 Repeat for H256. Use the best held-out RMSE setting as that model's A/B
@@ -117,12 +180,14 @@ For each candidate, run the complete resumable experiment. Substitute the
 candidate weight and clamp selected above:
 
 ```bash
-caffeinate -i python3 tools/run_nnue_experiment.py \
+systemd-inhibit --what=sleep --mode=block \
+  --why="Kepler NNUE A/B experiment" \
+  python3 tools/run_nnue_experiment.py \
   --engine build-release/kepler \
   --baseline models/kepler_baseline_pst_v1.nnue \
-  --candidate /private/tmp/kepler-strength-models-v1/halfkp_h128.nnue \
-  --validation-data /private/tmp/kepler-strength-data-v1/curated/validation.tsv \
-  --out-dir /private/tmp/kepler-strength-models-v1/h128-experiment \
+  --candidate "$HOME/kepler-data/kepler-strength-models-v1/halfkp_h128.nnue" \
+  --validation-data "$HOME/kepler-data/kepler-strength-data-v1/curated/validation.tsv" \
+  --out-dir "$HOME/kepler-data/kepler-strength-models-v1/h128-experiment" \
   --aa-games 100 \
   --games 2000 \
   --min-games 100 \
@@ -154,7 +219,7 @@ evidence; it is not a weak acceptance. The wrapper returns exit code 0, 1, or
 ```bash
 python3 tools/search_quality.py \
   --engine build-release/kepler \
-  --stockfish /opt/homebrew/bin/stockfish \
+  --stockfish "$(command -v stockfish)" \
   --pgn 'deploy/lichess/games/kepler_bot games.pgn' \
   --model /path/to/promoted.nnue \
   --engine-name kepler_bot \
@@ -164,7 +229,7 @@ python3 tools/search_quality.py \
   --threads 1 \
   --nnue-weight SELECTED_WEIGHT \
   --nnue-clamp SELECTED_CLAMP \
-  --json-out /private/tmp/kepler-search-quality.json
+  --json-out "$HOME/kepler-data/kepler-search-quality.json"
 ```
 
 Use the phase/material breakdown and worst positions to choose one search
