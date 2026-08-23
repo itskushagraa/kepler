@@ -22,6 +22,10 @@ struct SearchLimits
     bool usePruning = true;
     bool infinite = false;
     bool printInfo = true;
+    // Complete game hash history, including the current root position.
+    // Search extends this vector as it descends so threefold repetition can
+    // be distinguished from a single earlier occurrence.
+    std::vector<uint64_t> positionHistory;
 };
 
 struct SearchResult
@@ -67,3 +71,7 @@ private:
 };
 
 SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTable &tt, std::atomic<bool> &stopFlag);
+
+constexpr int SEARCH_MATE_SCORE = 30000;
+bool isSearchMateScore(int score);
+int searchMateMoves(int score);

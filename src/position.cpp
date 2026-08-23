@@ -394,7 +394,7 @@ void Position::makeMove(const Move &m, Undo &u)
     if (movedIndex == WK)
     {
         // O-O e1->g1 : move rook h1->f1
-        if (m.from == 4 && m.to == 6)
+        if (m.isCastle && m.from == 4 && m.to == 6)
         {
             clear_bit(pieceBB[WR], 7);
             set_bit(pieceBB[WR], 5);
@@ -405,7 +405,7 @@ void Position::makeMove(const Move &m, Undo &u)
             castleRookTo = 5;
         }
         // O-O-O e1->c1 : move rook a1->d1
-        else if (m.from == 4 && m.to == 2)
+        else if (m.isCastle && m.from == 4 && m.to == 2)
         {
             clear_bit(pieceBB[WR], 0);
             set_bit(pieceBB[WR], 3);
@@ -420,7 +420,7 @@ void Position::makeMove(const Move &m, Undo &u)
     else if (movedIndex == BK)
     {
         // O-O e8->g8 : rook h8->f8
-        if (m.from == 60 && m.to == 62)
+        if (m.isCastle && m.from == 60 && m.to == 62)
         {
             clear_bit(pieceBB[BR], 63);
             set_bit(pieceBB[BR], 61);
@@ -431,7 +431,7 @@ void Position::makeMove(const Move &m, Undo &u)
             castleRookTo = 61;
         }
         // O-O-O e8->c8 : rook a8->d8
-        else if (m.from == 60 && m.to == 58)
+        else if (m.isCastle && m.from == 60 && m.to == 58)
         {
             clear_bit(pieceBB[BR], 56);
             set_bit(pieceBB[BR], 59);
@@ -548,34 +548,12 @@ void Position::unmakeMove(const Move &m, const Undo &u)
         set_bit(pieceBB[u.capturedIndex], u.capturedSquare);
     }
 
-    if (m.isCastle)
+    // Undo records what makeMove actually changed. Restore from that record
+    // instead of trusting the caller to preserve a redundant move flag.
+    if (u.castleRookPiece != -1)
     {
-        if (us == WHITE)
-        {
-            if (m.from == 4 && m.to == 6)
-            {
-                clear_bit(pieceBB[WR], 5);
-                set_bit(pieceBB[WR], 7);
-            }
-            else if (m.from == 4 && m.to == 2)
-            {
-                clear_bit(pieceBB[WR], 3);
-                set_bit(pieceBB[WR], 0);
-            }
-        }
-        else
-        {
-            if (m.from == 60 && m.to == 62)
-            {
-                clear_bit(pieceBB[BR], 61);
-                set_bit(pieceBB[BR], 63);
-            }
-            else if (m.from == 60 && m.to == 58)
-            {
-                clear_bit(pieceBB[BR], 59);
-                set_bit(pieceBB[BR], 56);
-            }
-        }
+        clear_bit(pieceBB[u.castleRookPiece], u.castleRookTo);
+        set_bit(pieceBB[u.castleRookPiece], u.castleRookFrom);
     }
 
     occupancy[WHITE] = occupancy[BLACK] = 0ULL;
@@ -602,6 +580,33 @@ void Position::unmakeMove(const Move &m, const Undo &u)
         u.promotionIndex,
         u.castleRookPiece, u.castleRookFrom, u.castleRookTo,
         u.prevHash);
+}
+
+bool Position::isInsufficientMaterial() const
+{
+    if ((pieceBB[WP] | pieceBB[BP] | pieceBB[WR] | pieceBB[BR] |
+         pieceBB[WQ] | pieceBB[BQ]) != 0ULL)
+        return false;
+
+    const int knights = popcount(pieceBB[WN] | pieceBB[BN]);
+    const Bitboard bishops = pieceBB[WB] | pieceBB[BB];
+    const int bishopCount = popcount(bishops);
+    const int minorCount = knights + bishopCount;
+
+    // K vs K, K+B vs K, and K+N vs K.
+    if (minorCount <= 1)
+        return true;
+
+    // With bishops only, mate is impossible when every bishop is confined to
+    // the same square color (including promoted bishops).
+    if (knights == 0)
+    {
+        constexpr Bitboard darkSquares = 0xAA55AA55AA55AA55ULL;
+        const Bitboard lightSquares = ~darkSquares;
+        return (bishops & darkSquares) == 0ULL || (bishops & lightSquares) == 0ULL;
+    }
+
+    return false;
 }
 
 bool Position::isSquareAttacked(int sq, Side bySide) const

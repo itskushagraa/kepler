@@ -55,8 +55,8 @@ pgn_file_grouping: "all"
 correspondence:
   ponder: false
 
-# Safe first-live policy: one standard, casual, human 5+3 game at a time.
-# Widen this only after the first live game passes clock and log review.
+# Post-smoke policy: one standard, casual, human game at a time. Accept 3+0
+# and slower real-time controls; keep bullet and correspondence disabled.
 challenge:
   concurrency: 1
   games_reserved_for_humans: 0
@@ -64,21 +64,23 @@ challenge:
   preference: "human"
   accept_bot: false
   only_bot: false
-  min_base: 300
-  max_base: 300
-  min_increment: 3
-  max_increment: 3
+  min_base: 180
+  max_base: 10800
+  min_increment: 0
+  max_increment: 180
   variants:
     - standard
   time_controls:
     - blitz
+    - rapid
+    - classical
   modes:
     - casual
-  bullet_requires_increment: true
+  bullet_requires_increment: false
   max_simultaneous_games_per_user: 1
 
 greeting:
-  hello: "Hi, {opponent}! I'm Kepler, a homemade C++ chess engine. Good luck!"
+  hello: "Hi, {opponent}! I'm Kepler, a C++ chess engine. Glhf!"
   goodbye: "Good game!"
   hello_spectators: "Kepler is a homemade C++ chess engine."
   goodbye_spectators: "Thanks for watching!"

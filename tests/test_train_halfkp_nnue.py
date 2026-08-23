@@ -41,6 +41,8 @@ class HalfKPTrainingTests(unittest.TestCase):
         self.assertEqual(samples[0].group, "game-17")
         self.assertEqual(samples[0].kind, "tactical")
         self.assertEqual(samples[0].bucket, "-50_to_50")
+        self.assertEqual(samples[0].material, "pawn_only")
+        self.assertEqual(samples[0].teacher_cp, 25)
 
     def test_score_bucket_weights_raise_scarce_samples(self):
         samples = [
@@ -53,6 +55,32 @@ class HalfKPTrainingTests(unittest.TestCase):
         weights = trainer.sample_weights(samples, 1.0, 0.5)
         self.assertGreater(weights[-1], weights[0])
         self.assertAlmostEqual(float(weights.mean()), 1.0, places=6)
+
+    def test_segmented_metrics_expose_phase_error(self):
+        samples = [
+            trainer.HalfKPSample([1], [2], 10.0, "a", phase="opening"),
+            trainer.HalfKPSample([1], [2], -10.0, "b", phase="endgame"),
+        ]
+        import numpy as np
+
+        report = trainer.segmented_prediction_summary(
+            np.array([12.0, -6.0]), np.array([10.0, -10.0]), samples, "phase"
+        )
+        self.assertEqual(report["opening"]["mae"], 2.0)
+        self.assertEqual(report["endgame"]["mae"], 4.0)
+
+    def test_centipawn_target_preserves_units_and_blends_wdl(self):
+        row = (
+            "1\t400\t4k3/8/8/8/8/8/4P3/4K3 w - - 0 1\t0\tge_301\t3\t"
+            "checkmate\tgame-18\tregular\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.tsv"
+            path.write_text(row, encoding="utf-8")
+            samples = trainer.parse_samples(
+                str(path), 0.25, 400.0, 100.0, "centipawn", 2000.0, 600.0
+            )
+        self.assertEqual(samples[0].target, 450.0)
 
     def test_tactical_classifier_distinguishes_forcing_positions(self):
         self.assertFalse(nnue_cycle.is_tactical_position(chess.Board()))

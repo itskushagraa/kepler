@@ -34,6 +34,7 @@ public:
     void unmakeMove(const Move &m, const struct Undo &u);
     bool isSquareAttacked(int sq, Side bySide) const;
     bool isMoveLegal(const Move &m);
+    bool isInsufficientMaterial() const;
     int pieceIndexAt(int sq) const;
 
 private:

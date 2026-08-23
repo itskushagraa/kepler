@@ -34,6 +34,7 @@ from train_bootstrap_nnue import (
     oriented_sq,
     parse_board_state,
 )
+from curate_dataset import material_class_from_fen, phase_from_position, ply_from_fen
 
 
 @dataclass
@@ -44,6 +45,10 @@ class HalfKPSample:
     group: str
     kind: str = "regular"
     bucket: str = "unknown"
+    phase: str = "unknown"
+    material: str = "unknown"
+    result_stm: int = 0
+    teacher_cp: int = 0
 
 
 def sha256_file(path: Path) -> str:
@@ -84,6 +89,9 @@ def parse_samples(
     result_weight: float,
     cp_scale: float,
     target_cp: float,
+    target_mode: str = "legacy-tanh",
+    target_clip: float = 2000.0,
+    wdl_cp: float = 600.0,
 ) -> List[HalfKPSample]:
     samples: List[HalfKPSample] = []
     alpha = max(0.0, min(1.0, result_weight))
@@ -131,9 +139,31 @@ def parse_samples(
 
             kind = parts[8].strip() if len(parts) > 8 and parts[8].strip() else "regular"
             bucket = parts[4].strip() if len(parts) > 4 and parts[4].strip() else "unknown"
-            score_target = math.tanh(score_cp_stm / cp_scale)
-            target = (alpha * result_stm + (1.0 - alpha) * score_target) * target_cp
-            samples.append(HalfKPSample(us_features, them_features, target, group, kind, bucket))
+            fen = parts[2]
+            ply = ply_from_fen(fen)
+            phase = parts[9].strip() if len(parts) > 9 and parts[9].strip() else phase_from_position(fen, ply, 20, 60)
+            material = parts[10].strip() if len(parts) > 10 and parts[10].strip() else material_class_from_fen(fen)
+            if target_mode == "centipawn":
+                score_target = max(-target_clip, min(target_clip, score_cp_stm))
+                result_target = result_stm * max(1.0, wdl_cp)
+                target = alpha * result_target + (1.0 - alpha) * score_target
+            else:
+                score_target = math.tanh(score_cp_stm / cp_scale)
+                target = (alpha * result_stm + (1.0 - alpha) * score_target) * target_cp
+            samples.append(
+                HalfKPSample(
+                    us_features,
+                    them_features,
+                    target,
+                    group,
+                    kind,
+                    bucket,
+                    phase,
+                    material,
+                    int(result_stm),
+                    int(score_cp_stm),
+                )
+            )
 
     return samples
 
@@ -223,6 +253,35 @@ def sample_weights(
         ],
         dtype=np.float32,
     )
+
+
+def prediction_summary(
+    prediction: np.ndarray, targets: np.ndarray, samples: Sequence[HalfKPSample]
+) -> Dict[str, float | int | None]:
+    if len(samples) == 0:
+        return {"count": 0, "rmse": None, "mae": None, "bias": None}
+    errors = prediction.astype(np.float64) - targets.astype(np.float64)
+    return {
+        "count": len(samples),
+        "rmse": float(np.sqrt(np.mean(np.square(errors)))),
+        "mae": float(np.mean(np.abs(errors))),
+        "bias": float(np.mean(errors)),
+    }
+
+
+def segmented_prediction_summary(
+    prediction: np.ndarray,
+    targets: np.ndarray,
+    samples: Sequence[HalfKPSample],
+    attribute: str,
+) -> Dict[str, Dict[str, float | int | None]]:
+    report: Dict[str, Dict[str, float | int | None]] = {}
+    for value in sorted({str(getattr(sample, attribute)) for sample in samples}):
+        indexes = [index for index, sample in enumerate(samples) if str(getattr(sample, attribute)) == value]
+        report[value] = prediction_summary(
+            prediction[indexes], targets[indexes], [samples[index] for index in indexes]
+        )
+    return report
 
 
 def train(
@@ -494,6 +553,14 @@ def main() -> None:
     parser.add_argument("--result-weight", type=float, default=0.1)
     parser.add_argument("--cp-scale", type=float, default=400.0)
     parser.add_argument("--target-cp", type=float, default=100.0)
+    parser.add_argument(
+        "--target-mode",
+        choices=["centipawn", "legacy-tanh"],
+        default="centipawn",
+        help="Centipawn mode preserves eval units; legacy-tanh reproduces older runs.",
+    )
+    parser.add_argument("--target-clip", type=float, default=2000.0)
+    parser.add_argument("--wdl-cp", type=float, default=600.0)
     parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--tactical-weight", type=float, default=1.5)
     parser.add_argument(
@@ -506,15 +573,51 @@ def main() -> None:
     parser.add_argument("--min-epochs", type=int, default=15)
     parser.add_argument("--min-delta", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--min-training-samples", type=int, default=0)
+    parser.add_argument("--min-training-groups", type=int, default=0)
+    parser.add_argument(
+        "--max-generalization-gap",
+        type=float,
+        default=0.0,
+        help="Maximum validation-minus-training RMSE; 0 disables the gate.",
+    )
+    parser.add_argument(
+        "--strength-ready",
+        action="store_true",
+        help="Require the scale/diversity expected for a promotion-quality network.",
+    )
     args = parser.parse_args()
 
-    samples = parse_samples(args.data, args.result_weight, args.cp_scale, args.target_cp)
+    if args.strength_ready:
+        args.min_training_samples = max(args.min_training_samples, 800_000)
+        args.min_training_groups = max(args.min_training_groups, 16_000)
+        args.max_generalization_gap = (
+            min(args.max_generalization_gap, 25.0)
+            if args.max_generalization_gap > 0.0
+            else 25.0
+        )
+
+    samples = parse_samples(
+        args.data,
+        args.result_weight,
+        args.cp_scale,
+        args.target_cp,
+        args.target_mode,
+        max(1.0, args.target_clip),
+        max(1.0, args.wdl_cp),
+    )
     if not samples:
         raise SystemExit("No valid HalfKP rows found in data file.")
     if args.validation_data:
         train_samples = samples
         validation_samples = parse_samples(
-            args.validation_data, args.result_weight, args.cp_scale, args.target_cp
+            args.validation_data,
+            args.result_weight,
+            args.cp_scale,
+            args.target_cp,
+            args.target_mode,
+            max(1.0, args.target_clip),
+            max(1.0, args.wdl_cp),
         )
         if not validation_samples:
             raise SystemExit("No valid HalfKP rows found in validation data file.")
@@ -531,6 +634,15 @@ def main() -> None:
             )
         except ValueError as error:
             raise SystemExit(str(error)) from error
+
+    if len(train_samples) < args.min_training_samples:
+        raise SystemExit(
+            f"training quality gate failed: {len(train_samples)} samples < {args.min_training_samples}"
+        )
+    if len(train_groups) < args.min_training_groups:
+        raise SystemExit(
+            f"training quality gate failed: {len(train_groups)} game groups < {args.min_training_groups}"
+        )
 
     train_us, train_them = padded_features(train_samples)
     validation_us, validation_them = padded_features(validation_samples)
@@ -588,6 +700,7 @@ def main() -> None:
     quantized_validation_error = weighted_rmse(
         quantized_validation, validation_targets, validation_weight_values
     )
+    generalization_gap = quantized_validation_error - quantized_train_error
     output_path = Path(args.out).resolve()
     write_numpy_model(output_path, feature_q, hidden_q, output_q, output_bias_q, scale)
 
@@ -617,6 +730,21 @@ def main() -> None:
         "tactical_validation_samples": sum(sample.kind == "tactical" for sample in validation_samples),
         "training_score_bucket_counts": dict(Counter(sample.bucket for sample in train_samples)),
         "validation_score_bucket_counts": dict(Counter(sample.bucket for sample in validation_samples)),
+        "training_phase_counts": dict(Counter(sample.phase for sample in train_samples)),
+        "validation_phase_counts": dict(Counter(sample.phase for sample in validation_samples)),
+        "training_material_counts": dict(Counter(sample.material for sample in train_samples)),
+        "validation_material_counts": dict(Counter(sample.material for sample in validation_samples)),
+        "training_result_counts": dict(Counter(str(sample.result_stm) for sample in train_samples)),
+        "validation_result_counts": dict(Counter(str(sample.result_stm) for sample in validation_samples)),
+        "target": {
+            "mode": args.target_mode,
+            "result_weight": max(0.0, min(1.0, args.result_weight)),
+            "teacher_cp_weight": 1.0 - max(0.0, min(1.0, args.result_weight)),
+            "cp_scale": max(1.0, args.cp_scale),
+            "target_cp": max(1.0, args.target_cp),
+            "target_clip": max(1.0, args.target_clip),
+            "wdl_cp": max(1.0, args.wdl_cp),
+        },
         "score_balance_power": max(0.0, min(1.0, args.score_balance_power)),
         "best_epoch": trained["best_epoch"],
         "epochs_completed": trained["epochs_completed"],
@@ -627,12 +755,38 @@ def main() -> None:
         "validation_rmse": validation_error,
         "quantized_train_rmse": quantized_train_error,
         "quantized_validation_rmse": quantized_validation_error,
+        "generalization_gap": generalization_gap,
+        "quantized_validation_by_phase": segmented_prediction_summary(
+            quantized_validation, validation_targets, validation_samples, "phase"
+        ),
+        "quantized_validation_by_material": segmented_prediction_summary(
+            quantized_validation, validation_targets, validation_samples, "material"
+        ),
+        "quantized_validation_by_result": segmented_prediction_summary(
+            quantized_validation, validation_targets, validation_samples, "result_stm"
+        ),
+        "quality_checks": {
+            "minimum_training_samples_met": len(train_samples) >= args.min_training_samples,
+            "minimum_training_groups_met": len(train_groups) >= args.min_training_groups,
+            "generalization_gap_met": args.max_generalization_gap <= 0.0
+            or generalization_gap <= args.max_generalization_gap,
+            "strength_ready": args.strength_ready
+            and len(train_samples) >= args.min_training_samples
+            and len(train_groups) >= args.min_training_groups
+            and generalization_gap <= args.max_generalization_gap,
+        },
         "quant_scale": scale,
         "history": trained["history"],
         "output": str(output_path),
         "output_sha256": sha256_file(output_path),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+
+    if args.max_generalization_gap > 0.0 and generalization_gap > args.max_generalization_gap:
+        raise SystemExit(
+            "training quality gate failed: generalization gap "
+            f"{generalization_gap:.3f} > {args.max_generalization_gap:.3f}; metrics: {metrics_path}"
+        )
 
     for key in (
         "arch", "input_size", "hidden_size", "samples", "training_samples",

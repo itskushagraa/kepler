@@ -122,7 +122,7 @@ namespace
 
     bool isGameTerminal(Position &p, const std::unordered_map<uint64_t, int> &reps, int ply, int maxPly, int &whiteResult)
     {
-        if (p.halfmoveClock >= 100 || ply >= maxPly)
+        if (p.halfmoveClock >= 100 || p.isInsufficientMaterial() || ply >= maxPly)
         {
             whiteResult = 0;
             return true;
@@ -159,6 +159,7 @@ void runUciLoop()
     std::string cmd;
     Position pos;
     pos.setStartPos();
+    std::vector<uint64_t> positionHistory{pos.hashKey};
 
     TranspositionTable tt;
     tt.resizeMB(64);
@@ -402,6 +403,7 @@ void runUciLoop()
             // selected evaluation model. EvalFile/UseBaseline are persistent
             // UCI options and remain in force until explicitly changed.
             Nnue::invalidate(pos.nnueAccumulator);
+            positionHistory.assign(1, pos.hashKey);
         }
         else if (cmd.rfind("position", 0) == 0)
         {
@@ -429,6 +431,8 @@ void runUciLoop()
                     pos.fromFEN(fen);
             }
 
+            positionHistory.assign(1, pos.hashKey);
+
             while (iss >> token)
             {
                 if (token == "moves")
@@ -438,7 +442,10 @@ void runUciLoop()
                     {
                         Move m;
                         if (parseMoveUci(pos, moveStr, m))
+                        {
                             pos.makeMove(m);
+                            positionHistory.push_back(pos.hashKey);
+                        }
                     }
                 }
             }
@@ -510,6 +517,7 @@ void runUciLoop()
                 limits.contempt = contemptCp;
                 limits.moveOverheadMs = moveOverheadMs;
                 limits.printInfo = false;
+                limits.positionHistory.assign(1, benchPos.hashKey);
 
                 auto t0 = std::chrono::steady_clock::now();
                 SearchResult result = search(benchPos, limits, tt, stopFlag);
@@ -652,6 +660,7 @@ void runUciLoop()
                 std::unordered_map<uint64_t, int> reps;
                 reps.reserve(1024);
                 reps[gamePos.hashKey] = 1;
+                std::vector<uint64_t> gameHistory{gamePos.hashKey};
 
                 std::vector<SelfplaySample> samples;
                 samples.reserve(maxPly);
@@ -672,6 +681,7 @@ void runUciLoop()
                     Move m = legal.moves[dist(rng)];
                     gamePos.makeMove(m);
                     reps[gamePos.hashKey]++;
+                    gameHistory.push_back(gamePos.hashKey);
                     ply++;
                 }
 
@@ -688,6 +698,7 @@ void runUciLoop()
                     limits.threads = searchThreads;
                     limits.contempt = contemptCp;
                     limits.moveOverheadMs = moveOverheadMs;
+                    limits.positionHistory = gameHistory;
 
                     SearchResult sr = search(gamePos, limits, tt, stopFlag);
                     if (ply >= minSamplePly && (ply % sampleEvery) == 0)
@@ -719,6 +730,7 @@ void runUciLoop()
 
                     gamePos.makeMove(best);
                     reps[gamePos.hashKey]++;
+                    gameHistory.push_back(gamePos.hashKey);
                     ply++;
                 }
 
@@ -778,6 +790,7 @@ void runUciLoop()
             limits.contempt = contemptCp;
             limits.moveOverheadMs = moveOverheadMs;
             limits.printInfo = false;
+            limits.positionHistory = positionHistory;
 
             stopFlag.store(false, std::memory_order_relaxed);
             Position probePos = pos;
@@ -792,7 +805,8 @@ void runUciLoop()
                                    ? "0000"
                                    : moveToUci(sr.bestMove);
             std::cout << "info string probe depth " << sr.depth
-                      << " scorecp " << sr.score
+                      << (isSearchMateScore(sr.score) ? " scoremate " : " scorecp ")
+                      << (isSearchMateScore(sr.score) ? searchMateMoves(sr.score) : sr.score)
                       << " nodes " << nodes
                       << " time " << ms
                       << " nps " << nps
@@ -853,6 +867,7 @@ void runUciLoop()
             actualLimits.contempt = contemptCp;
             actualLimits.usePruning = usePruning;
             actualLimits.moveOverheadMs = moveOverheadMs;
+            actualLimits.positionHistory = positionHistory;
             searchThread = std::thread([searchPos, actualLimits, &tt, &stopFlag, &searching]() mutable
                                        {
                                            SearchResult result = search(searchPos, actualLimits, tt, stopFlag);

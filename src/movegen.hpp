@@ -45,6 +45,7 @@ struct MoveList
 
         std::size_t size() const { return count; }
         bool empty() const { return count == 0; }
+        void clear() { count = 0; }
         Move &front() { return data[0]; }
         const Move &front() const { return data[0]; }
         Move &operator[](std::size_t i) { return data[i]; }

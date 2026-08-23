@@ -24,6 +24,7 @@ def row(ordinal, game, score, ply, kind):
         kind=kind,
         phase=curate.phase_from_ply(ply, 20, 60),
         fields=[],
+        material="queens",
     )
 
 
@@ -68,6 +69,27 @@ class DatasetCurationTests(unittest.TestCase):
         self.assertTrue(validation)
         self.assertFalse(train & validation)
         self.assertEqual(train | validation, {sample.game_id for sample in rows})
+
+    def test_phase_and_material_use_board_contents(self):
+        opening = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        ending = "8/8/8/8/8/8/4P3/4K2k w - - 0 60"
+        self.assertEqual(curate.phase_from_position(opening, 0, 20, 60), "opening")
+        self.assertEqual(curate.phase_from_position(ending, 118, 20, 60), "endgame")
+        self.assertEqual(curate.material_class_from_fen(ending), "pawn_only")
+
+    def test_summary_exposes_scale_and_diversity_metrics(self):
+        rows = [row(index, f"game-{index}", 400 if index % 2 else 0, 30, "regular") for index in range(4)]
+        summary = curate.row_summary(rows)
+        self.assertEqual(summary["games"], 4)
+        self.assertEqual(summary["extreme_score_fraction"], 0.5)
+        self.assertEqual(summary["largest_game_fraction"], 0.25)
+        self.assertIn("material_counts", summary)
+
+    def test_extreme_fraction_is_enforced_when_replacements_exist(self):
+        rows = [row(index, f"game-{index}", 500, 30, "regular") for index in range(8)]
+        rows += [row(8 + index, f"quiet-{index}", 0, 30, "regular") for index in range(8)]
+        selected = curate.balance_rows(rows, 10, 0.0, 42, max_extreme_fraction=0.5)
+        self.assertLessEqual(sum(abs(sample.score_cp) >= 301 for sample in selected), 5)
 
 
 if __name__ == "__main__":

@@ -359,18 +359,26 @@ def generate_teacher_data(
 
             for g in range(1, games + 1):
                 board = chess.Board()
-                opening_id = (g - 1) % len(OPENINGS)
-                opening = OPENINGS[opening_id]
+                base_opening_id = (g - 1) % len(OPENINGS)
+                opening = OPENINGS[base_opening_id]
                 if not apply_opening(board, opening):
                     continue
 
+                random_opening: List[str] = []
                 for _ in range(randomplies):
                     if board.is_game_over(claim_draw=True):
                         break
                     legal = list(board.legal_moves)
                     if not legal:
                         break
-                    board.push(rng.choice(legal))
+                    random_move = rng.choice(legal)
+                    random_opening.append(random_move.uci())
+                    board.push(random_move)
+
+                opening_fingerprint = hashlib.sha256(
+                    " ".join([*opening, *random_opening]).encode("utf-8")
+                ).hexdigest()[:12]
+                opening_id = f"{base_opening_id}-{opening_fingerprint}"
 
                 game_uses_kepler = rng.random() < max(0.0, min(1.0, kepler_game_fraction))
                 if game_uses_kepler:

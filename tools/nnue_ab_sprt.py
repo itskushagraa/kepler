@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Paired nonlinear-NNUE A/B benchmark with sequential stopping.
 
-Model A is the baseline and model B is the candidate.  Every opening is
+Model A is the baseline and model B is the candidate. Every opening is
 played twice with the model colors swapped, so opening and color effects are
-paired.  Results are scored from model B's perspective and fed to a
-draw-aware, fixed-hypothesis Wald SPRT-style test.
+paired. Pair scores are fed to a five-outcome (pentanomial), draw-aware,
+fixed-hypothesis Wald SPRT-style test.
 
 The test hypotheses are explicit:
 
@@ -69,6 +69,27 @@ def llr_increment(
         raise ValueError(f"unknown result: {result}")
     p0 = result_probabilities(elo0, draw_rate)[result]
     p1 = result_probabilities(elo1, draw_rate)[result]
+    return math.log(max(1e-15, p1) / max(1e-15, p0))
+
+
+def pair_probabilities(elo: float, draw_rate: float) -> Dict[float, float]:
+    """Convolve two color-swapped game models into five pair-score outcomes."""
+    single = result_probabilities(elo, draw_rate)
+    by_score = {0.0: single["loss"], 0.5: single["draw"], 1.0: single["win"]}
+    probabilities = {score: 0.0 for score in (0.0, 0.5, 1.0, 1.5, 2.0)}
+    for first_score, first_probability in by_score.items():
+        for second_score, second_probability in by_score.items():
+            probabilities[first_score + second_score] += first_probability * second_probability
+    return probabilities
+
+
+def pair_llr_increment(
+    pair_score: float, elo0: float, elo1: float, draw_rate: float
+) -> float:
+    if pair_score not in {0.0, 0.5, 1.0, 1.5, 2.0}:
+        raise ValueError(f"invalid pair score: {pair_score}")
+    p0 = pair_probabilities(elo0, draw_rate)[pair_score]
+    p1 = pair_probabilities(elo1, draw_rate)[pair_score]
     return math.log(max(1e-15, p1) / max(1e-15, p0))
 
 
@@ -194,16 +215,12 @@ def write_pgn(path: Path, records: Iterable[dict]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Paired A/B SPRT-style NNUE benchmark.")
+    parser = argparse.ArgumentParser(description="Paired pentanomial NNUE A/B benchmark.")
     parser.add_argument("--engine", default="build-release/kepler")
-    parser.add_argument(
-        "--engine-b",
-        default="",
-        help="Optional candidate engine binary; defaults to --engine for NNUE-only tests.",
-    )
+    parser.add_argument("--engine-b", default="")
     parser.add_argument("--model-a", required=True, help="Baseline model.")
     parser.add_argument("--model-b", required=True, help="Candidate model.")
-    parser.add_argument("--games", type=int, default=64, help="Maximum games; must be even for pairing.")
+    parser.add_argument("--games", type=int, default=64, help="Maximum games; must be even.")
     limit_group = parser.add_mutually_exclusive_group()
     limit_group.add_argument("--nodes", type=int, default=None)
     limit_group.add_argument("--movetime", type=int, default=None, help="Milliseconds per move.")
@@ -212,10 +229,10 @@ def main() -> int:
     parser.add_argument("--hash", type=int, default=128)
     parser.add_argument("--nnue-weight-a", type=int, default=25)
     parser.add_argument("--nnue-weight-b", type=int, default=25)
-    parser.add_argument("--nnue-clamp-a", type=int, default=300, help="0 disables the baseline clamp.")
-    parser.add_argument("--nnue-clamp-b", type=int, default=300, help="0 disables the candidate clamp.")
+    parser.add_argument("--nnue-clamp-a", type=int, default=300)
+    parser.add_argument("--nnue-clamp-b", type=int, default=300)
     parser.add_argument("--max-plies", type=int, default=200)
-    parser.add_argument("--min-games", type=int, default=8, help="Do not stop before this many games.")
+    parser.add_argument("--min-games", type=int, default=8)
     parser.add_argument("--elo0", type=float, default=0.0)
     parser.add_argument("--elo1", type=float, default=30.0)
     parser.add_argument("--draw-rate", type=float, default=0.35)
@@ -225,6 +242,9 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--pgn-out", default="")
     parser.add_argument("--json-out", default="")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--aa-sanity", action="store_true")
+    parser.add_argument("--require-aa-report", default="")
     args = parser.parse_args()
 
     if args.games < 2 or args.games % 2:
@@ -233,6 +253,8 @@ def main() -> int:
         parser.error("--elo1 must be greater than --elo0")
     if args.min_games < 2 or args.min_games > args.games or args.min_games % 2:
         parser.error("--min-games must be even and between 2 and --games")
+    if args.resume and not args.json_out:
+        parser.error("--resume requires --json-out")
     for option, value, maximum in (
         ("--nnue-weight-a", args.nnue_weight_a, 100),
         ("--nnue-weight-b", args.nnue_weight_b, 100),
@@ -247,151 +269,247 @@ def main() -> int:
     model_a = Path(args.model_a).resolve()
     model_b = Path(args.model_b).resolve()
     for path in (engine_path, engine_b_path, model_a, model_b):
-        if not path.exists():
+        if not path.is_file():
             raise SystemExit(f"missing path: {path}")
+
+    engine_a_sha = sha256_file(engine_path)
+    engine_b_sha = sha256_file(engine_b_path)
+    model_a_sha = sha256_file(model_a)
+    model_b_sha = sha256_file(model_b)
+    if args.aa_sanity and (
+        engine_a_sha != engine_b_sha
+        or model_a_sha != model_b_sha
+        or args.nnue_weight_a != args.nnue_weight_b
+        or args.nnue_clamp_a != args.nnue_clamp_b
+    ):
+        parser.error("--aa-sanity requires identical engines, models, and evaluation options")
 
     lower, upper = sprt_bounds(args.alpha, args.beta)
     limit = choose_limit(args)
     rng = random.Random(args.seed)
     opening_indexes = list(range(len(OPENINGS)))
     rng.shuffle(opening_indexes)
-
-    a_wins = b_wins = draws = 0
-    llr = 0.0
-    decision = "continue"
-    records: List[dict] = []
-
-    with (
-        chess.engine.SimpleEngine.popen_uci(str(engine_path), timeout=args.timeout) as engine_a,
-        chess.engine.SimpleEngine.popen_uci(str(engine_b_path), timeout=args.timeout) as engine_b,
-    ):
-        engine_a.configure(
-            kepler_options(
-                args.hash, args.threads, model_a, args.nnue_weight_a, args.nnue_clamp_a
-            )
-        )
-        engine_b.configure(
-            kepler_options(
-                args.hash, args.threads, model_b, args.nnue_weight_b, args.nnue_clamp_b
-            )
-        )
-
-        for game_index in range(args.games):
-            pair_index = game_index // 2
-            opening_index = opening_indexes[pair_index % len(opening_indexes)]
-            opening = OPENINGS[opening_index]
-            a_is_white = game_index % 2 == 0
-            result, moves, termination = play_game(
-                engine_a, engine_b, opening, a_is_white, limit, args.max_plies
-            )
-            candidate_is_white = not a_is_white
-            outcome, score = candidate_score(result, candidate_is_white)
-            llr += llr_increment(outcome, args.elo0, args.elo1, args.draw_rate)
-            if result == "1-0":
-                if a_is_white:
-                    a_wins += 1
-                else:
-                    b_wins += 1
-            elif result == "0-1":
-                if a_is_white:
-                    b_wins += 1
-                else:
-                    a_wins += 1
-            else:
-                draws += 1
-
-            record = {
-                "Event": "Kepler NNUE Paired SPRT",
-                "Date": dt.datetime.now(dt.timezone.utc).strftime("%Y.%m.%d"),
-                "Round": game_index + 1,
-                "White": "A-baseline" if a_is_white else "B-candidate",
-                "Black": "B-candidate" if a_is_white else "A-baseline",
-                "Result": result,
-                "Termination": termination,
-                "OpeningIndex": opening_index,
-                "PairIndex": pair_index + 1,
-                "SPRTDecision": decision,
-                "moves": moves,
-            }
-            records.append(record)
-            games_played = game_index + 1
-            # Never stop between the two color-swapped games of an opening.
-            decision = paired_sprt_decision(
-                games_played, args.min_games, llr, lower, upper
-            )
-            record["SPRTDecision"] = decision
-            print(
-                f"game {games_played}/{args.games} pair={pair_index + 1} "
-                f"opening={opening_index} result={result} candidate={outcome} "
-                f"llr={llr:.3f} decision={decision}",
-                flush=True,
-            )
-            if decision != "continue":
-                break
-
-    total = len(records)
-    candidate_score_total = b_wins + 0.5 * draws
-    score_percent = candidate_score_total / max(1, total)
-    score_clamped = max(1e-6, min(1.0 - 1e-6, score_percent))
-    observed_elo = 400.0 * math.log10(score_clamped / (1.0 - score_clamped))
-    if decision == "continue":
-        decision = "inconclusive"
-
-    report = {
-        "status": decision,
-        "baseline": str(model_a),
-        "candidate": str(model_b),
-        "baseline_sha256": sha256_file(model_a),
-        "candidate_sha256": sha256_file(model_b),
-        "baseline_engine": str(engine_path),
-        "candidate_engine": str(engine_b_path),
-        "baseline_engine_sha256": sha256_file(engine_path),
-        "candidate_engine_sha256": sha256_file(engine_b_path),
-        "baseline_evaluation": {
-            "nnue_weight": args.nnue_weight_a,
-            "nnue_clamp": args.nnue_clamp_a,
-        },
-        "candidate_evaluation": {
-            "nnue_weight": args.nnue_weight_b,
-            "nnue_clamp": args.nnue_clamp_b,
-        },
-        "games": total,
-        "paired_games": total // 2,
-        "baseline_wins": a_wins,
-        "candidate_wins": b_wins,
-        "draws": draws,
-        "candidate_score": candidate_score_total,
-        "candidate_score_percent": score_percent,
-        "approx_observed_elo_difference": observed_elo,
+    json_path = Path(args.json_out).resolve() if args.json_out else None
+    pgn_path = Path(args.pgn_out).resolve() if args.pgn_out else None
+    test_kind = "aa_sanity" if args.aa_sanity else "ab_promotion"
+    run_configuration = {
+        "test_kind": test_kind,
+        "baseline_engine_sha256": engine_a_sha,
+        "candidate_engine_sha256": engine_b_sha,
+        "baseline_model_sha256": model_a_sha,
+        "candidate_model_sha256": model_b_sha,
+        "baseline_evaluation": {"nnue_weight": args.nnue_weight_a, "nnue_clamp": args.nnue_clamp_a},
+        "candidate_evaluation": {"nnue_weight": args.nnue_weight_b, "nnue_clamp": args.nnue_clamp_b},
+        "threads": args.threads,
+        "hash_mb": args.hash,
+        "limit": {"nodes": args.nodes, "movetime_ms": args.movetime, "depth": args.depth},
+        "max_plies": args.max_plies,
+        "seed": args.seed,
         "sprt": {
             "elo0": args.elo0,
             "elo1": args.elo1,
             "draw_rate": args.draw_rate,
             "alpha": args.alpha,
             "beta": args.beta,
-            "lower_boundary": lower,
-            "upper_boundary": upper,
-            "final_llr": llr,
-        },
-        "seed": args.seed,
-        "limit": {
-            "nodes": args.nodes,
-            "movetime_ms": args.movetime,
-            "depth": args.depth,
         },
     }
-    print(json.dumps(report, indent=2))
 
-    if args.pgn_out:
-        pgn_path = Path(args.pgn_out).resolve()
-        write_pgn(pgn_path, records)
+    if args.require_aa_report:
+        sanity_path = Path(args.require_aa_report).resolve()
+        sanity = json.loads(sanity_path.read_text(encoding="utf-8"))
+        if sanity.get("test_kind") != "aa_sanity" or not sanity.get("sanity", {}).get("passed"):
+            raise SystemExit(f"A/A prerequisite did not pass: {sanity_path}")
+        sanity_config = sanity.get("run_configuration", {})
+        required = {
+            "baseline_engine_sha256": run_configuration["baseline_engine_sha256"],
+            "baseline_model_sha256": run_configuration["baseline_model_sha256"],
+            "baseline_evaluation": run_configuration["baseline_evaluation"],
+            "threads": run_configuration["threads"],
+            "hash_mb": run_configuration["hash_mb"],
+            "limit": run_configuration["limit"],
+            "max_plies": run_configuration["max_plies"],
+        }
+        for key, expected in required.items():
+            if sanity_config.get(key) != expected:
+                raise SystemExit(f"A/A prerequisite mismatch for {key}: {sanity_path}")
+
+    records: List[dict] = []
+    if args.resume and json_path and json_path.exists():
+        previous = json.loads(json_path.read_text(encoding="utf-8"))
+        if previous.get("run_configuration") != run_configuration:
+            raise SystemExit("resume configuration does not match checkpoint")
+        records = list(previous.get("records", []))
+        if len(records) % 2 or len(records) > args.games:
+            raise SystemExit("resume checkpoint has an invalid paired-game count")
+
+    a_wins = b_wins = draws = 0
+    llr = 0.0
+    candidate_scores: List[float] = []
+    pair_scores: List[float] = []
+
+    def ingest(record: dict) -> None:
+        nonlocal a_wins, b_wins, draws, llr
+        a_is_white = record["White"] == "A-baseline"
+        outcome, score = candidate_score(record["Result"], not a_is_white)
+        record["CandidateOutcome"] = outcome
+        record["CandidateScore"] = score
+        candidate_scores.append(score)
+        if record["Result"] == "1-0":
+            a_wins += int(a_is_white)
+            b_wins += int(not a_is_white)
+        elif record["Result"] == "0-1":
+            b_wins += int(a_is_white)
+            a_wins += int(not a_is_white)
+        else:
+            draws += 1
+        if len(candidate_scores) % 2 == 0:
+            score_pair = candidate_scores[-2] + candidate_scores[-1]
+            pair_scores.append(score_pair)
+            llr += pair_llr_increment(score_pair, args.elo0, args.elo1, args.draw_rate)
+            record["PairScore"] = score_pair
+
+    resumed = list(records)
+    records.clear()
+    for record in resumed:
+        ingest(record)
+        records.append(record)
+
+    def build_sanity() -> dict:
+        if not pair_scores:
+            return {"passed": False, "reason": "no completed pairs"}
+        mean = sum(pair_scores) / len(pair_scores)
+        if len(pair_scores) > 1:
+            variance = sum((score - mean) ** 2 for score in pair_scores) / (len(pair_scores) - 1)
+            standard_error = math.sqrt(variance / len(pair_scores))
+        else:
+            standard_error = 0.0
+        balanced = abs(mean - 1.0) <= (3.0 * standard_error if standard_error else 1e-12)
+        score_rate = sum(candidate_scores) / len(candidate_scores)
+        return {
+            "passed": balanced and abs(score_rate - 0.5) <= 0.05,
+            "pair_mean": mean,
+            "pair_standard_error": standard_error,
+            "candidate_score_rate": score_rate,
+            "three_sigma_pair_balance": balanced,
+        }
+
+    def make_report(status: str) -> dict:
+        total = len(records)
+        candidate_total = sum(candidate_scores)
+        score_rate = candidate_total / max(1, total)
+        clamped = max(1e-6, min(1.0 - 1e-6, score_rate))
+        return {
+            "status": status,
+            "test_kind": test_kind,
+            "baseline": str(model_a),
+            "candidate": str(model_b),
+            "baseline_sha256": model_a_sha,
+            "candidate_sha256": model_b_sha,
+            "baseline_engine": str(engine_path),
+            "candidate_engine": str(engine_b_path),
+            "baseline_engine_sha256": engine_a_sha,
+            "candidate_engine_sha256": engine_b_sha,
+            "baseline_evaluation": run_configuration["baseline_evaluation"],
+            "candidate_evaluation": run_configuration["candidate_evaluation"],
+            "games": total,
+            "paired_games": len(pair_scores),
+            "baseline_wins": a_wins,
+            "candidate_wins": b_wins,
+            "draws": draws,
+            "candidate_score": candidate_total,
+            "candidate_score_percent": score_rate,
+            "approx_observed_elo_difference": 400.0 * math.log10(clamped / (1.0 - clamped)),
+            "pentanomial_counts": {
+                str(value): pair_scores.count(value) for value in (0.0, 0.5, 1.0, 1.5, 2.0)
+            },
+            "sprt": {
+                "method": "pentanomial_pair_likelihood",
+                **run_configuration["sprt"],
+                "lower_boundary": lower,
+                "upper_boundary": upper,
+                "final_llr": llr,
+            },
+            "sanity": build_sanity() if args.aa_sanity else None,
+            "seed": args.seed,
+            "limit": run_configuration["limit"],
+            "run_configuration": run_configuration,
+            "records": records,
+        }
+
+    def checkpoint(status: str) -> None:
+        if pgn_path:
+            write_pgn(pgn_path, records)
+        if json_path:
+            temporary = json_path.with_suffix(json_path.suffix + ".tmp")
+            temporary.write_text(json.dumps(make_report(status), indent=2) + "\n", encoding="utf-8")
+            temporary.replace(json_path)
+
+    decision = "continue"
+    if records and not args.aa_sanity:
+        decision = paired_sprt_decision(len(records), args.min_games, llr, lower, upper)
+
+    if args.aa_sanity or decision == "continue":
+        with (
+            chess.engine.SimpleEngine.popen_uci(str(engine_path), timeout=args.timeout) as engine_a,
+            chess.engine.SimpleEngine.popen_uci(str(engine_b_path), timeout=args.timeout) as engine_b,
+        ):
+            engine_a.configure(kepler_options(args.hash, args.threads, model_a, args.nnue_weight_a, args.nnue_clamp_a))
+            engine_b.configure(kepler_options(args.hash, args.threads, model_b, args.nnue_weight_b, args.nnue_clamp_b))
+            for game_index in range(len(records), args.games):
+                pair_index = game_index // 2
+                opening_index = opening_indexes[pair_index % len(opening_indexes)]
+                a_is_white = game_index % 2 == 0
+                result, moves, termination = play_game(
+                    engine_a, engine_b, OPENINGS[opening_index], a_is_white, limit, args.max_plies
+                )
+                record = {
+                    "Event": "Kepler NNUE Paired Pentanomial",
+                    "Date": dt.datetime.now(dt.timezone.utc).strftime("%Y.%m.%d"),
+                    "Round": game_index + 1,
+                    "White": "A-baseline" if a_is_white else "B-candidate",
+                    "Black": "B-candidate" if a_is_white else "A-baseline",
+                    "Result": result,
+                    "Termination": termination,
+                    "OpeningIndex": opening_index,
+                    "PairIndex": pair_index + 1,
+                    "SPRTDecision": decision,
+                    "moves": moves,
+                }
+                ingest(record)
+                records.append(record)
+                games_played = len(records)
+                if not args.aa_sanity:
+                    decision = paired_sprt_decision(games_played, args.min_games, llr, lower, upper)
+                record["SPRTDecision"] = decision
+                print(
+                    f"game {games_played}/{args.games} pair={pair_index + 1} "
+                    f"opening={opening_index} result={result} "
+                    f"candidate={record['CandidateOutcome']} llr={llr:.3f} decision={decision}",
+                    flush=True,
+                )
+                if games_played % 2 == 0:
+                    checkpoint(decision)
+                if not args.aa_sanity and decision != "continue":
+                    break
+
+    if args.aa_sanity:
+        decision = "sanity_pass" if build_sanity()["passed"] else "sanity_fail"
+    elif decision == "continue":
+        decision = "inconclusive"
+    report = make_report(decision)
+    checkpoint(decision)
+    print(json.dumps({key: value for key, value in report.items() if key != "records"}, indent=2))
+    if pgn_path:
         print(f"PGN {pgn_path}")
-    if args.json_out:
-        json_path = Path(args.json_out).resolve()
-        json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if json_path:
         print(f"JSON {json_path}")
-
-    return {"accept_candidate": 0, "reject_candidate": 1, "inconclusive": 2}[decision]
+    return {
+        "accept_candidate": 0,
+        "reject_candidate": 1,
+        "inconclusive": 2,
+        "sanity_pass": 0,
+        "sanity_fail": 1,
+    }[decision]
 
 
 if __name__ == "__main__":

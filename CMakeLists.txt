@@ -72,6 +72,45 @@ add_executable(search_budget
 target_include_directories(search_budget PRIVATE src)
 add_test(NAME search_node_budget COMMAND search_budget)
 
+add_executable(search_endgame
+    tests/search_endgame.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/search.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+    src/tb.cpp
+)
+target_include_directories(search_endgame PRIVATE src)
+add_test(NAME search_deep_endgame COMMAND search_endgame)
+
+add_executable(search_correctness
+    tests/search_correctness.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/search.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+    src/tb.cpp
+)
+target_include_directories(search_correctness PRIVATE src)
+add_test(NAME search_correctness COMMAND search_correctness)
+
+add_executable(position_roundtrip
+    tests/position_roundtrip.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+)
+target_include_directories(position_roundtrip PRIVATE src)
+add_test(
+    NAME position_roundtrip
+    COMMAND position_roundtrip "${CMAKE_CURRENT_SOURCE_DIR}/models/kepler_baseline_pst_v1.nnue")
+
 add_executable(eval_consistency
     tests/eval_consistency.cpp
     src/position.cpp
@@ -108,4 +147,9 @@ if(Python3_Interpreter_FOUND)
                 "$<TARGET_FILE:nnue_tool>"
                 "${CMAKE_CURRENT_BINARY_DIR}/uci_persistence_test.nnue"
                 "${CMAKE_CURRENT_SOURCE_DIR}/models/kepler_baseline_pst_v1.nnue")
+    add_test(
+        NAME uci_rules
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/uci_rules.py"
+                "$<TARGET_FILE:kepler>")
 endif()

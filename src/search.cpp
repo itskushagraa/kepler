@@ -369,6 +369,23 @@ void TranspositionTable::store(uint64_t key, int depth, int score, uint8_t bound
     replace->bestMove = bestMove;
 }
 
+struct ScoredMove
+{
+    int score = 0;
+    Move move{};
+};
+
+// Move generation and ordering need roughly 7 KiB of scratch space per ply.
+// Keeping those buffers in recursive negamax frames exhausts the 512 KiB
+// worker-thread stack on macOS near MAX_PLY.  Allocate one reusable buffer per
+// ply in SearchState instead: this preserves the search ceiling without a heap
+// allocation at every node.
+struct MoveOrderingBuffer
+{
+    MoveList generated;
+    std::array<ScoredMove, MoveList::MoveBuffer::kMaxMoves> ordered{};
+};
+
 struct SearchState
 {
     struct EvalCacheEntry
@@ -399,6 +416,7 @@ struct SearchState
     int moveStack[MAX_PLY]{};
     std::vector<uint64_t> repHistory;
     std::vector<EvalCacheEntry> evalCache;
+    std::vector<MoveOrderingBuffer> moveOrderingBuffers;
 };
 
 struct NullUndo
@@ -471,6 +489,50 @@ int drawScore(const Position &pos, const SearchState &st)
     if (st.contempt == 0)
         return 0;
     return (pos.sideToMove == st.rootSide) ? st.contempt : -st.contempt;
+}
+
+bool isThreefoldRepetition(const Position &pos, const SearchState &st)
+{
+    int occurrences = 0;
+    for (uint64_t key : st.repHistory)
+    {
+        if (key == pos.hashKey && ++occurrences >= 3)
+            return true;
+    }
+    return false;
+}
+
+bool isRuleDraw(const Position &pos, const SearchState &st)
+{
+    return pos.halfmoveClock >= 100 || pos.isInsufficientMaterial() ||
+           isThreefoldRepetition(pos, st);
+}
+
+bool adjudicateRuleDraw(Position &pos, const SearchState &st, int ply, int &score)
+{
+    if (!isRuleDraw(pos, st))
+        return false;
+
+    // Checkmate ends the game before a fifty-move or repetition draw can be
+    // claimed.  Generating legal moves here is only necessary for the rare
+    // case where a draw condition and check occur at the same node.
+    const Side us = pos.sideToMove;
+    const Side them = (us == WHITE ? BLACK : WHITE);
+    const int kingSq = pos.kingSquare[us];
+    const bool inCheck = kingSq != -1 && pos.isSquareAttacked(kingSq, them);
+    if (inCheck)
+    {
+        MoveList legal;
+        generateLegalMoves(pos, legal);
+        if (legal.moves.empty())
+        {
+            score = -MATE_SCORE + ply;
+            return true;
+        }
+    }
+
+    score = drawScore(pos, st);
+    return true;
 }
 
 int evaluateCached(Position &pos, SearchState &st)
@@ -650,9 +712,9 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
     if (ply >= MAX_PLY - 1)
         return evaluateCached(pos, st);
 
-    // 50-move rule draw.
-    if (pos.halfmoveClock >= 100)
-        return drawScore(pos, st);
+    int terminalScore = 0;
+    if (adjudicateRuleDraw(pos, st, ply, terminalScore))
+        return terminalScore;
 
     int tbScore = 0;
     if (tryTablebaseProbe(pos, 1, ply, tbScore))
@@ -679,14 +741,11 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
             return alpha;
     }
 
-    MoveList moves;
+    MoveOrderingBuffer &moveBuffer = st.moveOrderingBuffers[ply];
+    MoveList &moves = moveBuffer.generated;
+    moves.moves.clear();
     generateAllMoves(pos, moves);
-    struct ScoredMove
-    {
-        int score = 0;
-        Move move{};
-    };
-    std::array<ScoredMove, MoveList::MoveBuffer::kMaxMoves> moveVec{};
+    auto &moveVec = moveBuffer.ordered;
     std::size_t moveCount = 0;
     Move emptyMove{};
     for (const auto &m : moves.moves)
@@ -773,9 +832,9 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
     if (ply >= MAX_PLY - 1)
         return evaluateCached(pos, st);
 
-    // 50-move rule draw.
-    if (pos.halfmoveClock >= 100)
-        return drawScore(pos, st);
+    int terminalScore = 0;
+    if (adjudicateRuleDraw(pos, st, ply, terminalScore))
+        return terminalScore;
 
     st.nodes++;
     int alphaOrig = alpha;
@@ -798,16 +857,6 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
 
     if (depth == 0)
         return quiescence(pos, st, alpha, beta, ply);
-
-    if (!st.repHistory.empty())
-    {
-        uint64_t key = pos.hashKey;
-        for (size_t i = 0; i + 1 < st.repHistory.size(); ++i)
-        {
-            if (st.repHistory[i] == key)
-                return drawScore(pos, st);
-        }
-    }
 
     int tbScore = 0;
     if (tryTablebaseProbe(pos, depth, ply, tbScore))
@@ -867,9 +916,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
             int reduction = 2 + depth / 4;
             NullUndo nu;
             doNullMove(pos, nu);
-            st.repHistory.push_back(pos.hashKey);
             int score = -negamax(pos, st, std::max(0, depth - 1 - reduction), -beta, -beta + 1, ply + 1, false);
-            st.repHistory.pop_back();
             undoNullMove(pos, nu);
 
             if (shouldStop(st))
@@ -894,14 +941,11 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         }
     }
 
-    MoveList moves;
+    MoveOrderingBuffer &moveBuffer = st.moveOrderingBuffers[ply];
+    MoveList &moves = moveBuffer.generated;
+    moves.moves.clear();
     generateAllMoves(pos, moves);
-    struct ScoredMove
-    {
-        int score = 0;
-        Move move{};
-    };
-    std::array<ScoredMove, MoveList::MoveBuffer::kMaxMoves> moveVec{};
+    auto &moveVec = moveBuffer.ordered;
     std::size_t moveCount = 0;
     for (const auto &m : moves.moves)
         moveVec[moveCount++] = {scoreMove(pos, m, ttMove, ply, st), m};
@@ -911,6 +955,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
     int bestScore = -INF_SCORE;
     Move bestMove{};
     int legalMoves = 0;
+    int searchedMoves = 0;
     bool searchedPvMove = false;
     std::vector<std::pair<int, int>> quietTried;
     quietTried.reserve(48);
@@ -949,14 +994,14 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         if (st.usePruning && !pvNode && !inCheck && !givesCheck && depth <= 3 && isQuiet)
         {
             int lmpThreshold = 12 + 8 * depth + depth * depth; // depth1:21 depth2:32 depth3:45
-            if (legalMoves > lmpThreshold)
+            if (searchedMoves > 0 && legalMoves > lmpThreshold)
             {
                 pos.unmakeMove(m, u);
                 continue;
             }
         }
 
-        if (st.usePruning && !pvNode && !inCheck && !givesCheck && isQuiet && depth <= 3 && legalMoves > 1)
+        if (st.usePruning && !pvNode && !inCheck && !givesCheck && isQuiet && depth <= 3 && searchedMoves > 0)
         {
             if (!haveStaticEval)
             {
@@ -980,7 +1025,8 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         int score = 0;
         int nextDepth = depth - 1;
 
-        if (st.usePruning && !pvNode && !inCheck && !givesCheck && depth <= 3 && haveSee && see < -(95 * depth))
+        if (st.usePruning && !pvNode && !inCheck && !givesCheck && depth <= 3 &&
+            haveSee && see < -(95 * depth) && searchedMoves > 0)
         {
             st.moveStack[ply] = prevMoveStack;
             st.repHistory.pop_back();
@@ -990,6 +1036,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
 
         bool lmrCandidate = !pvNode && !inCheck && !givesCheck && isQuiet &&
                             depth >= 3 && legalMoves >= 4;
+        searchedMoves++;
         if (lmrCandidate)
         {
             int reduction = 1;
@@ -1093,6 +1140,11 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         return drawScore(pos, st);
     }
 
+    // Every nonterminal node must search at least one legal move. Returning
+    // -INF here would be interpreted as a mate score by the parent.
+    if (searchedMoves == 0)
+        return evaluateCached(pos, st);
+
     uint8_t bound = 3;
     if (bestScore <= alphaOrig)
         bound = 1;
@@ -1135,8 +1187,10 @@ SearchResult searchSingle(
     st.rootSide = pos.sideToMove;
     st.workerId = workerId;
     st.evalCache.assign(1u << 15, SearchState::EvalCacheEntry{});
-    st.repHistory.clear();
-    st.repHistory.push_back(pos.hashKey);
+    st.moveOrderingBuffers.resize(MAX_PLY);
+    st.repHistory = limits.positionHistory;
+    if (st.repHistory.empty() || st.repHistory.back() != pos.hashKey)
+        st.repHistory.push_back(pos.hashKey);
     std::fill(std::begin(st.moveStack), std::end(st.moveStack), -1);
     for (int from = 0; from < 64; ++from)
     {
@@ -1158,6 +1212,13 @@ SearchResult searchSingle(
         Side them = (us == WHITE) ? BLACK : WHITE;
         bool inCheck = (pos.kingSquare[us] != -1) && pos.isSquareAttacked(pos.kingSquare[us], them);
         result.score = inCheck ? -MATE_SCORE : drawScore(pos, st);
+        return result;
+    }
+
+    if (isRuleDraw(pos, st))
+    {
+        result.bestMove = rootLegal.moves.front();
+        result.score = drawScore(pos, st);
         return result;
     }
 
@@ -1456,7 +1517,12 @@ SearchResult searchSingle(
         int nps = (elapsed > 0) ? (int)(allNodes * 1000 / elapsed) : (int)allNodes;
         if (limits.printInfo)
         {
-            std::cout << "info depth " << d << " score cp " << score
+            std::cout << "info depth " << d << " score ";
+            if (isSearchMateScore(score))
+                std::cout << "mate " << searchMateMoves(score);
+            else
+                std::cout << "cp " << score;
+            std::cout
                       << " nodes " << allNodes << " nps " << nps
                       << " time " << elapsed << " string qnodes " << st.qnodes << "\n";
         }
@@ -1524,6 +1590,9 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     for (auto &w : workers)
         w.join();
 
+    // Lazy-SMP helpers improve the shared TT, but the main worker owns the
+    // answer. Picking the highest equal-depth helper score introduces a
+    // systematic optimistic bias and nondeterministic best moves.
     SearchResult best = workerResults[0];
     uint64_t totalNodes = 0;
     uint64_t totalQnodes = 0;
@@ -1531,10 +1600,22 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     {
         totalNodes += r.nodes;
         totalQnodes += r.qnodes;
-        if (r.depth > best.depth || (r.depth == best.depth && r.score > best.score))
-            best = r;
     }
     best.nodes = totalNodes;
     best.qnodes = totalQnodes;
     return best;
+}
+
+bool isSearchMateScore(int score)
+{
+    return score > SEARCH_MATE_SCORE - 1000 || score < -SEARCH_MATE_SCORE + 1000;
+}
+
+int searchMateMoves(int score)
+{
+    if (!isSearchMateScore(score))
+        return 0;
+    const int plies = std::max(0, SEARCH_MATE_SCORE - std::abs(score));
+    const int moves = (plies + 1) / 2;
+    return score >= 0 ? moves : -moves;
 }

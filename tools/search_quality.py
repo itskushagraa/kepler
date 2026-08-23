@@ -6,22 +6,32 @@ import json
 import random
 import statistics
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import chess
 import chess.engine
 import chess.pgn
 
+from eval_quality import classify_position, sha256_file
 
-def collect_positions(path: Path, name: str) -> List[Tuple[str, str]]:
-    positions: List[Tuple[str, str]] = []
+
+def collect_positions(path: Path, name: str) -> List[dict]:
+    positions: List[dict] = []
     with path.open("r", encoding="utf-8") as source:
         while game := chess.pgn.read_game(source):
             board = game.board()
             for move in game.mainline_moves():
                 player = game.headers.get("White" if board.turn else "Black", "")
                 if name.lower() in player.lower() and len(board.move_stack) >= 8:
-                    positions.append((board.fen(), move.uci()))
+                    phase, material = classify_position(board)
+                    positions.append(
+                        {
+                            "fen": board.fen(),
+                            "pgn_move": move.uci(),
+                            "phase": phase,
+                            "material": material,
+                        }
+                    )
                 board.push(move)
     return positions
 
@@ -35,6 +45,20 @@ def percentile(values: List[float], fraction: float) -> float:
     upper = min(len(ordered) - 1, lower + 1)
     blend = index - lower
     return ordered[lower] * (1.0 - blend) + ordered[upper] * blend
+
+
+def grouped_loss(details: List[dict], key: str) -> dict:
+    groups = {}
+    for name in sorted({detail[key] for detail in details}):
+        values = [detail["cp_loss"] for detail in details if detail[key] == name]
+        groups[name] = {
+            "count": len(values),
+            "average_cp_loss": statistics.fmean(values),
+            "median_cp_loss": statistics.median(values),
+            "p90_cp_loss": percentile(values, 0.90),
+            "max_cp_loss": max(values),
+        }
+    return groups
 
 
 def main() -> None:
@@ -63,6 +87,10 @@ def main() -> None:
             raise SystemExit(f"missing path: {path}")
 
     available = collect_positions(pgn_path, args.engine_name)
+    if not available:
+        raise SystemExit(
+            f"no positions found for engine name {args.engine_name!r} in {pgn_path}"
+        )
     rng = random.Random(args.seed)
     chosen = rng.sample(available, min(max(1, args.positions), len(available)))
     details = []
@@ -85,8 +113,8 @@ def main() -> None:
         engine.configure(engine_options)
         stockfish.configure({**common, "UCI_LimitStrength": False})
 
-        for index, (fen, played_pgn) in enumerate(chosen, 1):
-            board = chess.Board(fen)
+        for index, sampled in enumerate(chosen, 1):
+            board = chess.Board(sampled["fen"])
             original_side = board.turn
             reference = stockfish.analyse(board, sf_limit)
             pv = reference.get("pv", [])
@@ -94,6 +122,9 @@ def main() -> None:
                 continue
             best_move = pv[0]
             before = reference["score"].pov(original_side).score(mate_score=20000)
+            # Kepler currently reports depth/score/nodes but no UCI ``pv``
+            # token. SimpleEngine.analyse() therefore has no selected move;
+            # play() waits for and returns the authoritative bestmove.
             selected = engine.play(board, engine_limit).move
             if selected is None or selected not in board.legal_moves or before is None:
                 continue
@@ -109,8 +140,10 @@ def main() -> None:
             losses.append(loss)
             details.append(
                 {
-                    "fen": fen,
-                    "pgn_move": played_pgn,
+                    "fen": sampled["fen"],
+                    "pgn_move": sampled["pgn_move"],
+                    "phase": sampled["phase"],
+                    "material": sampled["material"],
                     "engine_move": selected.uci(),
                     "stockfish_move": best_move.uci(),
                     "cp_before": before,
@@ -124,9 +157,16 @@ def main() -> None:
                 flush=True,
             )
 
+    if not losses:
+        raise SystemExit("search audit produced no analyzable positions")
+
     report = {
         "engine": str(engine_path),
+        "engine_sha256": sha256_file(engine_path),
         "model": str(Path(args.model).resolve()) if args.model else "",
+        "model_sha256": sha256_file(Path(args.model).resolve()) if args.model else None,
+        "stockfish": str(stockfish_path),
+        "stockfish_sha256": sha256_file(stockfish_path),
         "pgn": str(pgn_path),
         "available_positions": len(available),
         "sampled_positions": len(chosen),
@@ -138,6 +178,8 @@ def main() -> None:
         "median_cp_loss": statistics.median(losses) if losses else 0.0,
         "p90_cp_loss": percentile(losses, 0.90),
         "max_cp_loss": max(losses, default=0.0),
+        "by_phase": grouped_loss(details, "phase") if details else {},
+        "by_material": grouped_loss(details, "material") if details else {},
         "details": details,
     }
     output = Path(args.json_out).resolve()

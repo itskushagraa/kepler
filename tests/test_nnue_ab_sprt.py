@@ -24,6 +24,13 @@ class NnueAbSprtTests(unittest.TestCase):
         self.assertGreater(win, 0.0)
         self.assertLess(loss, 0.0)
 
+    def test_pentanomial_probabilities_sum_to_one(self):
+        probabilities = sprt.pair_probabilities(20.0, 0.7)
+        self.assertEqual(set(probabilities), {0.0, 0.5, 1.0, 1.5, 2.0})
+        self.assertAlmostEqual(sum(probabilities.values()), 1.0)
+        self.assertGreater(sprt.pair_llr_increment(2.0, 0.0, 20.0, 0.7), 0.0)
+        self.assertLess(sprt.pair_llr_increment(0.0, 0.0, 20.0, 0.7), 0.0)
+
     def test_bounds_and_decisions(self):
         lower, upper = sprt.sprt_bounds(0.05, 0.05)
         self.assertLess(lower, 0.0)

@@ -96,10 +96,11 @@ python3 tools/lichess_bot.py status
 python3 tools/lichess_bot.py smoke
 ```
 
-The committed first-live policy accepts one standard, casual, human 5+3 game
-at a time. It disables pondering, variants, bot opponents, rated games,
-automatic matchmaking, online move sources, automatic draws, and resigning.
-Review `deploy/lichess/config.yml` before widening that policy.
+The committed live policy accepts one standard, casual, human real-time game
+at a time, from 3+0 through classical controls. It disables bullet,
+correspondence, pondering, variants, bot opponents, rated games, automatic
+matchmaking, online move sources, automatic draws, and resigning. Review
+`deploy/lichess/config.yml` before widening that policy.
 
 The Lichess account must have never played a game. While signed into that
 account, create a personal OAuth token with only the `bot:play` scope using
@@ -134,7 +135,38 @@ Lichess immediately if it is ever exposed.
 
 ---
 
-## NNUE Workflow
+## Strength Development Workflow
+
+The trusted production workflow is documented in
+[`docs/strength-development.md`](docs/strength-development.md). It covers the
+current measured diagnosis, resumable million-row teacher generation,
+game-disjoint curation gates, matched H128/H256 training in centipawn units,
+static blend calibration, mandatory A/A sanity, resumable paired
+pentanomial A/B promotion, search-quality diagnosis, and final reference
+rating.
+
+The shortest production sequence is:
+
+```bash
+python3 tools/generate_teacher_shards.py \
+  --out-dir /private/tmp/kepler-strength-data-v1
+python3 tools/train_strength_models.py \
+  --dataset-dir /private/tmp/kepler-strength-data-v1/curated \
+  --out-dir /private/tmp/kepler-strength-models-v1
+python3 tools/run_nnue_experiment.py \
+  --baseline models/kepler_baseline_pst_v1.nnue \
+  --candidate /private/tmp/kepler-strength-models-v1/halfkp_h128.nnue \
+  --validation-data /private/tmp/kepler-strength-data-v1/curated/validation.tsv \
+  --out-dir /private/tmp/kepler-strength-models-v1/h128-experiment
+```
+
+Use `caffeinate -i` for the long generation/training/playing stages on macOS.
+Do not use smoke-test bypasses when producing a model for promotion.
+
+## Low-scale NNUE Workflow
+
+The manual commands below are useful for experiments and debugging. They do
+not satisfy the production data-size and diversity gates by themselves.
 
 ### 1) Generate Teacher Data
 
@@ -179,7 +211,8 @@ python3 tools/curate_dataset.py \
 
 The curator namespaces explicit game IDs across shards, removes duplicate
 positions while retaining side/castling/en-passant state, balances phase,
-score band, and regular/tactical samples, and splits only on complete games.
+material class, score band, and regular/tactical samples, and splits only on
+complete games.
 Inspect `curation_manifest.json`; `game_leakage` must be empty.
 
 ### 3) Train nonlinear HalfKP candidates
@@ -192,6 +225,9 @@ python3 tools/train_halfkp_nnue.py \
   --hidden-size 128 \
   --epochs 80 \
   --batch-size 256 \
+  --target-mode centipawn \
+  --target-clip 2000 \
+  --wdl-cp 600 \
   --result-weight 0.1 \
   --ridge 0.0003 \
   --tactical-weight 1.0 \
@@ -366,9 +402,9 @@ result<TAB>score<TAB>fen<TAB>...metadata
 ```
 
 The current columns are result, Stockfish score from the side to move, FEN,
-ply, score bucket, opening ID, termination, game ID, and sample kind. Legacy
-trainers ignore metadata after FEN; the nonlinear HalfKP trainer uses game ID
-and sample kind.
+ply, score bucket, opening ID, termination, game ID, sample kind, phase, and
+material class. Legacy trainers ignore metadata after FEN; the nonlinear
+HalfKP trainer uses all available grouping and diagnostic metadata.
 
 ---
 
@@ -387,6 +423,11 @@ deploy/     Secret-free deployment configuration (including Lichess BOT)
 ## Docs & Usage
 
 Key scripts:
+- `tools/generate_teacher_shards.py` - resumable parallel production data generation
+- `tools/train_strength_models.py` - matched strength-gated H128/H256 training
+- `tools/eval_quality.py` - held-out static evaluation diagnostics
+- `tools/tune_eval_blend.py` - held-out NNUE weight/clamp calibration
+- `tools/run_nnue_experiment.py` - static audit + A/A + paired A/B orchestration
 - `tools/nnue_cycle.py` - teacher data generation + training loop
 - `tools/train_bootstrap_nnue.py` - NNUE trainer
 - `tools/train_halfkp_nnue.py` - nonlinear HalfKP trainer
@@ -406,10 +447,17 @@ I like playing chess; I love Machine Learning and algorithm analysis/design, so 
 
 ## Development Status
 
-Kepler is usable for UCI analysis and self-play, with legal move generation,
-alpha-beta search, classical evaluation, optional NNUE evaluation, and a NNUE
-data/training workflow. Historical internal gauntlets reported roughly
-1800–2000 Elo; that is not a current benchmark and should be refreshed.
+Kepler is usable for UCI analysis, Lichess BOT play, and self-play, with legal
+move generation, alpha-beta search, classical evaluation, optional NNUE
+evaluation, and a strength-gated NNUE workflow. Historical internal gauntlets
+reported roughly 1800–2000 Elo; that is not a current benchmark and should not
+be cited as the engine's present rating.
+
+The August 2026 correctness pass repaired castling make/unmake corruption,
+full-game threefold detection, insufficient-material adjudication, mate-score
+UCI reporting, first-move over-pruning, deep-search stack exhaustion, and
+multithread node/result ownership. The old H256 result predates those repairs
+and is not promotion evidence.
 
 The active development areas are search strength, evaluation tuning,
 training-data quality, and optional Syzygy support. Perft is the primary

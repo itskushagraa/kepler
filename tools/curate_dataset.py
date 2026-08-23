@@ -47,6 +47,7 @@ class Row:
     kind: str
     phase: str
     fields: List[str]
+    material: str = "unknown"
 
     @property
     def balance_kind(self) -> str:
@@ -54,11 +55,11 @@ class Row:
 
     @property
     def stratum(self) -> str:
-        return f"{self.balance_kind}|{self.phase}|{self.bucket}"
+        return f"{self.balance_kind}|{self.phase}|{self.material}|{self.bucket}"
 
     def serialize(self) -> str:
         fields = list(self.fields)
-        while len(fields) < 9:
+        while len(fields) < 11:
             fields.append("")
         fields[:9] = [
             str(self.result_stm),
@@ -71,6 +72,8 @@ class Row:
             self.game_id,
             self.kind,
         ]
+        fields[9] = self.phase
+        fields[10] = self.material
         return "\t".join(fields) + "\n"
 
 
@@ -111,6 +114,37 @@ def phase_from_ply(ply: Optional[int], cut1: int, cut2: int) -> str:
     if ply <= cut2:
         return "middlegame"
     return "endgame"
+
+
+def material_class_from_fen(fen: str) -> str:
+    board = fen.split()[0] if fen.split() else ""
+    queens = board.count("q") + board.count("Q")
+    rooks = board.count("r") + board.count("R")
+    minors = sum(board.count(piece) for piece in "nNbB")
+    pawns = board.count("p") + board.count("P")
+    if queens:
+        return "queens"
+    if rooks:
+        return "rooks_no_queens"
+    if minors:
+        return "minor_only"
+    if pawns:
+        return "pawn_only"
+    return "bare_kings"
+
+
+def phase_from_position(fen: str, ply: Optional[int], cut1: int, cut2: int) -> str:
+    board = fen.split()[0] if fen.split() else ""
+    values = {"n": 320, "b": 330, "r": 500, "q": 900}
+    nonpawn_material = sum(
+        value * (board.count(piece) + board.count(piece.upper()))
+        for piece, value in values.items()
+    )
+    if ply is not None and ply <= cut1 and nonpawn_material >= 5200:
+        return "opening"
+    if nonpawn_material <= 2600 or (ply is not None and ply > cut2 and nonpawn_material <= 3600):
+        return "endgame"
+    return "middlegame"
 
 
 def position_key(fen: str) -> str:
@@ -205,8 +239,9 @@ def load_rows(
                     termination=termination,
                     game_id=game_id,
                     kind=kind,
-                    phase=phase_from_ply(ply, phase_cut1, phase_cut2),
+                    phase=phase_from_position(fen, ply, phase_cut1, phase_cut2),
                     fields=fields,
+                    material=material_class_from_fen(fen),
                 )
             )
             ordinal += 1
@@ -229,7 +264,7 @@ def even_sample(rows: Sequence[Row], target: int, seed: int, key_name: str) -> L
     groups: Dict[str, List[Row]] = defaultdict(list)
     for row in rows:
         if key_name == "phase_bucket":
-            key = f"{row.phase}|{row.bucket}"
+            key = f"{row.phase}|{row.material}|{row.bucket}"
         elif key_name == "full":
             key = row.stratum
         else:
@@ -259,7 +294,11 @@ def even_sample(rows: Sequence[Row], target: int, seed: int, key_name: str) -> L
 
 
 def balance_rows(
-    rows: Sequence[Row], max_rows: int, tactical_fraction: float, seed: int
+    rows: Sequence[Row],
+    max_rows: int,
+    tactical_fraction: float,
+    seed: int,
+    max_extreme_fraction: float = 1.0,
 ) -> List[Row]:
     target = len(rows) if max_rows <= 0 else min(len(rows), max_rows)
     if target >= len(rows):
@@ -276,6 +315,23 @@ def balance_rows(
     if len(selected) < target:
         remainder = [row for row in rows if row.ordinal not in selected_ordinals]
         selected += even_sample(remainder, target - len(selected), seed + 37, "full")
+
+    extreme_limit = int(target * max(0.0, min(1.0, max_extreme_fraction)))
+    selected_extreme = [row for row in selected if abs(row.score_cp) >= 301]
+    if len(selected_extreme) > extreme_limit:
+        selected_ordinals = {row.ordinal for row in selected}
+        replacements = [
+            row
+            for row in rows
+            if row.ordinal not in selected_ordinals and abs(row.score_cp) < 301
+        ]
+        replace_count = min(len(selected_extreme) - extreme_limit, len(replacements))
+        remove_ordinals = {
+            row.ordinal
+            for row in even_sample(selected_extreme, replace_count, seed + 41, "full")
+        }
+        selected = [row for row in selected if row.ordinal not in remove_ordinals]
+        selected += even_sample(replacements, replace_count, seed + 43, "full")
     return sorted(selected, key=lambda row: row.ordinal)
 
 
@@ -326,12 +382,20 @@ def histogram(rows: Sequence[Row], attribute: str) -> Dict[str, int]:
 
 def row_summary(rows: Sequence[Row]) -> Dict[str, object]:
     tactical_rows = sum(row.balance_kind == "tactical" for row in rows)
+    extreme_rows = sum(abs(row.score_cp) >= 301 for row in rows)
+    game_counts = Counter(row.game_id for row in rows)
     return {
         "rows": len(rows),
         "games": len({row.game_id for row in rows}),
         "tactical_fraction": tactical_rows / len(rows) if rows else None,
         "phase_counts": histogram(rows, "phase"),
+        "material_counts": histogram(rows, "material"),
         "score_bucket_counts": histogram(rows, "bucket"),
+        "result_counts": dict(sorted(Counter(str(row.result_stm) for row in rows).items())),
+        "opening_counts": dict(sorted(Counter(row.opening_id for row in rows).items())),
+        "termination_counts": dict(sorted(Counter(row.termination for row in rows).items())),
+        "extreme_score_fraction": extreme_rows / len(rows) if rows else None,
+        "largest_game_fraction": max(game_counts.values(), default=0) / len(rows) if rows else None,
         "sample_kind_counts": dict(sorted(Counter(row.balance_kind for row in rows).items())),
         "joint_stratum_counts": dict(sorted(Counter(row.stratum for row in rows).items())),
     }
@@ -355,6 +419,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--phase-cut1", type=int, default=20)
     parser.add_argument("--phase-cut2", type=int, default=60)
+    parser.add_argument("--min-rows", type=int, default=0, help="Fail the quality gate below this row count.")
+    parser.add_argument("--min-games", type=int, default=0, help="Fail the quality gate below this game count.")
+    parser.add_argument("--min-opening-ids", type=int, default=0)
+    parser.add_argument("--max-extreme-score-fraction", type=float, default=1.0)
+    parser.add_argument("--max-game-row-fraction", type=float, default=1.0)
+    parser.add_argument(
+        "--strength-ready",
+        action="store_true",
+        help="Require at least 1M positions from 20k games and basic diversity checks.",
+    )
     args = parser.parse_args()
 
     if not 0.0 <= args.tactical_fraction <= 1.0:
@@ -363,6 +437,16 @@ def main() -> None:
         parser.error("--val-fraction must be between 0 and 0.8")
     if args.phase_cut2 <= args.phase_cut1:
         parser.error("--phase-cut2 must be greater than --phase-cut1")
+    if not 0.0 <= args.max_extreme_score_fraction <= 1.0:
+        parser.error("--max-extreme-score-fraction must be between 0 and 1")
+    if not 0.0 <= args.max_game_row_fraction <= 1.0:
+        parser.error("--max-game-row-fraction must be between 0 and 1")
+    if args.strength_ready:
+        args.min_rows = max(args.min_rows, 1_000_000)
+        args.min_games = max(args.min_games, 20_000)
+        args.min_opening_ids = max(args.min_opening_ids, 32)
+        args.max_extreme_score_fraction = min(args.max_extreme_score_fraction, 0.50)
+        args.max_game_row_fraction = min(args.max_game_row_fraction, 0.002)
 
     inputs = [Path(value).resolve() for value in args.input]
     for path in inputs:
@@ -374,7 +458,13 @@ def main() -> None:
     unique_rows, source_stats = load_rows(inputs, args.phase_cut1, args.phase_cut2)
     if not unique_rows:
         raise SystemExit("No valid unique rows found.")
-    curated = balance_rows(unique_rows, max(0, args.max_rows), args.tactical_fraction, args.seed)
+    curated = balance_rows(
+        unique_rows,
+        max(0, args.max_rows),
+        args.tactical_fraction,
+        args.seed,
+        args.max_extreme_score_fraction,
+    )
     train_games, val_games = split_games(curated, args.val_fraction, args.seed)
     train = [row for row in curated if row.game_id in train_games]
     validation = [row for row in curated if row.game_id in val_games]
@@ -390,8 +480,23 @@ def main() -> None:
         "\n".join(sorted(val_games)) + ("\n" if val_games else ""), encoding="utf-8"
     )
 
+    curated_summary = row_summary(curated)
+    diversity_checks = {
+        "minimum_rows_met": len(curated) >= args.min_rows,
+        "minimum_games_met": len({row.game_id for row in curated}) >= args.min_games,
+        "minimum_openings_met": len({row.opening_id for row in curated}) >= args.min_opening_ids,
+        "extreme_score_fraction_met": (
+            curated_summary["extreme_score_fraction"] is not None
+            and curated_summary["extreme_score_fraction"] <= args.max_extreme_score_fraction
+        ),
+        "game_concentration_met": (
+            curated_summary["largest_game_fraction"] is not None
+            and curated_summary["largest_game_fraction"] <= args.max_game_row_fraction
+        ),
+    }
+
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "inputs": [
             {"path": str(path), "sha256": sha256_file(path)} for path in inputs
         ],
@@ -402,10 +507,16 @@ def main() -> None:
             "seed": args.seed,
             "phase_cut1": args.phase_cut1,
             "phase_cut2": args.phase_cut2,
+            "min_rows": args.min_rows,
+            "min_games": args.min_games,
+            "min_opening_ids": args.min_opening_ids,
+            "max_extreme_score_fraction": args.max_extreme_score_fraction,
+            "max_game_row_fraction": args.max_game_row_fraction,
+            "strength_ready": args.strength_ready,
         },
         "source_rows": source_stats,
         "before_balancing": row_summary(unique_rows),
-        "curated": row_summary(curated),
+        "curated": curated_summary,
         "train": row_summary(train),
         "validation": row_summary(validation),
         "game_leakage": sorted(train_games & val_games),
@@ -415,6 +526,8 @@ def main() -> None:
             "game_leakage_free": not bool(train_games & val_games),
             "both_splits_nonempty": bool(train)
             and (args.val_fraction == 0.0 or bool(validation)),
+            **diversity_checks,
+            "strength_ready": args.strength_ready and all(diversity_checks.values()),
         },
         "artifacts": {
             "curated_tsv": str(curated_path),
@@ -432,6 +545,9 @@ def main() -> None:
     manifest_path = out_dir / "curation_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"manifest": str(manifest_path), "curated": manifest["curated"]}, indent=2))
+    if not all(diversity_checks.values()):
+        failed = ", ".join(name for name, passed in diversity_checks.items() if not passed)
+        raise SystemExit(f"dataset quality gate failed: {failed}")
 
 
 if __name__ == "__main__":

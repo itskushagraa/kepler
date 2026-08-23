@@ -682,8 +682,10 @@ void generateLegalMoves(const Position &pos, MoveList &legal)
                     continue; // can't pass through or into check
             }
 
-            // preserve promo kind (defaults to Q only if you came from old path)
-            legal.add(m.from, m.to, m.isCapture, m.isPromotion, m.promoPiece);
+            // Preserve every semantic flag. In particular, dropping isCastle
+            // here makes root search move the rook on makeMove(), but not put
+            // it back on unmakeMove(), corrupting every later root branch.
+            legal.moves.push_back(m);
         }
     }
 }

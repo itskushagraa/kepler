@@ -30,15 +30,18 @@ class LichessDeploymentTests(unittest.TestCase):
         self.assertEqual(self.config["token"], "set-via-LICHESS_BOT_TOKEN")
         self.assertNotIn("Bearer ", CONFIG_PATH.read_text(encoding="utf-8"))
 
-    def test_first_live_policy_is_standard_casual_five_plus_three(self):
+    def test_live_policy_is_standard_casual_three_plus_zero_or_slower(self):
         challenge = self.config["challenge"]
         self.assertEqual(challenge["concurrency"], 1)
         self.assertEqual(challenge["variants"], ["standard"])
-        self.assertEqual(challenge["time_controls"], ["blitz"])
+        self.assertEqual(challenge["time_controls"], ["blitz", "rapid", "classical"])
+        self.assertNotIn("bullet", challenge["time_controls"])
+        self.assertNotIn("correspondence", challenge["time_controls"])
         self.assertEqual(challenge["modes"], ["casual"])
-        self.assertEqual((challenge["min_base"], challenge["max_base"]), (300, 300))
-        self.assertEqual((challenge["min_increment"], challenge["max_increment"]), (3, 3))
+        self.assertEqual((challenge["min_base"], challenge["max_base"]), (180, 10800))
+        self.assertEqual((challenge["min_increment"], challenge["max_increment"]), (0, 180))
         self.assertFalse(challenge["accept_bot"])
+        self.assertFalse(challenge["only_bot"])
         self.assertFalse(self.config["matchmaking"]["allow_matchmaking"])
 
     def test_engine_configuration_matches_keplers_uci_options(self):
