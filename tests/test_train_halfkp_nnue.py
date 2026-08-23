@@ -40,6 +40,19 @@ class HalfKPTrainingTests(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0].group, "game-17")
         self.assertEqual(samples[0].kind, "tactical")
+        self.assertEqual(samples[0].bucket, "-50_to_50")
+
+    def test_score_bucket_weights_raise_scarce_samples(self):
+        samples = [
+            trainer.HalfKPSample([1], [2], 0.0, f"game-{index}", bucket="common")
+            for index in range(9)
+        ]
+        samples.append(
+            trainer.HalfKPSample([1], [2], 0.0, "rare-game", bucket="rare")
+        )
+        weights = trainer.sample_weights(samples, 1.0, 0.5)
+        self.assertGreater(weights[-1], weights[0])
+        self.assertAlmostEqual(float(weights.mean()), 1.0, places=6)
 
     def test_tactical_classifier_distinguishes_forcing_positions(self):
         self.assertFalse(nnue_cycle.is_tactical_position(chess.Board()))

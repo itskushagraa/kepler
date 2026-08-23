@@ -20,6 +20,7 @@ import json
 import math
 import random
 import struct
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -42,6 +43,7 @@ class HalfKPSample:
     target: float
     group: str
     kind: str = "regular"
+    bucket: str = "unknown"
 
 
 def sha256_file(path: Path) -> str:
@@ -128,9 +130,10 @@ def parse_samples(
                 legacy_rows += 1
 
             kind = parts[8].strip() if len(parts) > 8 and parts[8].strip() else "regular"
+            bucket = parts[4].strip() if len(parts) > 4 and parts[4].strip() else "unknown"
             score_target = math.tanh(score_cp_stm / cp_scale)
             target = (alpha * result_stm + (1.0 - alpha) * score_target) * target_cp
-            samples.append(HalfKPSample(us_features, them_features, target, group, kind))
+            samples.append(HalfKPSample(us_features, them_features, target, group, kind, bucket))
 
     return samples
 
@@ -199,9 +202,25 @@ def weighted_rmse(prediction: np.ndarray, target: np.ndarray, weights: np.ndarra
     return float(np.sqrt(np.sum(squared * weights) / max(1e-9, float(np.sum(weights)))))
 
 
-def sample_weights(samples: Sequence[HalfKPSample], tactical_weight: float) -> np.ndarray:
+def sample_weights(
+    samples: Sequence[HalfKPSample], tactical_weight: float, score_balance_power: float = 0.0
+) -> np.ndarray:
+    bucket_counts = Counter(sample.bucket for sample in samples)
+    average_count = len(samples) / max(1, len(bucket_counts))
+    power = max(0.0, min(1.0, score_balance_power))
+    bucket_factors = {
+        bucket: (average_count / count) ** power for bucket, count in bucket_counts.items()
+    }
+    normalization = sum(
+        bucket_counts[bucket] * factor for bucket, factor in bucket_factors.items()
+    ) / max(1, len(samples))
     return np.array(
-        [tactical_weight if sample.kind == "tactical" else 1.0 for sample in samples],
+        [
+            (tactical_weight if sample.kind == "tactical" else 1.0)
+            * bucket_factors[sample.bucket]
+            / max(1e-9, normalization)
+            for sample in samples
+        ],
         dtype=np.float32,
     )
 
@@ -477,6 +496,12 @@ def main() -> None:
     parser.add_argument("--target-cp", type=float, default=100.0)
     parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--tactical-weight", type=float, default=1.5)
+    parser.add_argument(
+        "--score-balance-power",
+        type=float,
+        default=0.5,
+        help="Inverse-frequency score-bucket weighting power, 0 disables and 1 fully balances.",
+    )
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--min-epochs", type=int, default=15)
     parser.add_argument("--min-delta", type=float, default=0.05)
@@ -511,8 +536,12 @@ def main() -> None:
     validation_us, validation_them = padded_features(validation_samples)
     train_targets = np.array([sample.target for sample in train_samples], dtype=np.float32)
     validation_targets = np.array([sample.target for sample in validation_samples], dtype=np.float32)
-    train_weight_values = sample_weights(train_samples, max(1.0, args.tactical_weight))
-    validation_weight_values = sample_weights(validation_samples, max(1.0, args.tactical_weight))
+    train_weight_values = sample_weights(
+        train_samples, max(1.0, args.tactical_weight), args.score_balance_power
+    )
+    validation_weight_values = sample_weights(
+        validation_samples, max(1.0, args.tactical_weight), args.score_balance_power
+    )
     hidden_size = max(8, min(1536, args.hidden_size))
 
     trained = train(
@@ -586,6 +615,9 @@ def main() -> None:
         "validation_groups": len(validation_groups),
         "tactical_training_samples": sum(sample.kind == "tactical" for sample in train_samples),
         "tactical_validation_samples": sum(sample.kind == "tactical" for sample in validation_samples),
+        "training_score_bucket_counts": dict(Counter(sample.bucket for sample in train_samples)),
+        "validation_score_bucket_counts": dict(Counter(sample.bucket for sample in validation_samples)),
+        "score_balance_power": max(0.0, min(1.0, args.score_balance_power)),
         "best_epoch": trained["best_epoch"],
         "epochs_completed": trained["epochs_completed"],
         "early_stopped": trained["early_stopped"],

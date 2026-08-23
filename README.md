@@ -144,6 +144,7 @@ python3 tools/train_halfkp_nnue.py \
   --result-weight 0.1 \
   --ridge 0.0003 \
   --tactical-weight 1.0 \
+  --score-balance-power 0.5 \
   --patience 10
 ```
 
