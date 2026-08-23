@@ -2,6 +2,7 @@
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import random
@@ -9,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -38,6 +40,14 @@ OPENINGS: List[List[str]] = [
 ]
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def apply_opening(board: chess.Board, opening: List[str]) -> bool:
     for mv in opening:
         move = chess.Move.from_uci(mv)
@@ -54,15 +64,26 @@ def white_result_from_board(board: chess.Board) -> int:
     return 1 if outcome.winner == chess.WHITE else -1
 
 
-def is_tactical_position(board: chess.Board) -> bool:
-    """Identify forcing positions worth sampling more densely.
+def is_tactical_position(board: chess.Board, best_move: Optional[chess.Move] = None) -> bool:
+    """Classify positions where Stockfish's selected move is forcing.
 
-    Checks, promotions, captures, and available checking moves are included.
-    This is intentionally a broad data-generation classifier; Stockfish still
-    supplies the target and the trainer applies the tactical sample weight.
+    With no selected move this remains a broad, inexpensive prefilter used to
+    decide whether an extra tactical label is worth requesting. Stored sample
+    kinds always pass Stockfish's principal-variation move, avoiding the old
+    behavior where nearly every middlegame position was called tactical just
+    because some legal capture existed.
     """
     if board.is_check():
         return True
+    if best_move is not None:
+        if best_move not in board.legal_moves:
+            return False
+        if best_move.promotion is not None or board.is_capture(best_move):
+            return True
+        board.push(best_move)
+        gives_check = board.is_check()
+        board.pop()
+        return gives_check
     for move in list(board.legal_moves):
         if move.promotion is not None or board.is_capture(move):
             return True
@@ -284,14 +305,21 @@ def generate_teacher_data(
     play_elo: int,
     label_elo: int,
     analyze_ms: int,
+    analyze_nodes: int,
     kepler_hash: int,
     kepler_threads: int,
     sf_hash: int,
     sf_threads: int,
+    kepler_game_fraction: float,
 ) -> Dict[str, int]:
     play_limit = chess.engine.Limit(time=max(0.001, movetime_ms / 1000.0))
-    analyze_limit = chess.engine.Limit(time=max(0.001, analyze_ms / 1000.0))
+    analyze_limit = (
+        chess.engine.Limit(nodes=max(1, analyze_nodes))
+        if analyze_nodes > 0
+        else chess.engine.Limit(time=max(0.001, analyze_ms / 1000.0))
+    )
     rng = random.Random(seed)
+    started_at = time.monotonic()
 
     whitewins = 0
     blackwins = 0
@@ -303,6 +331,8 @@ def generate_teacher_data(
     kept_by_opening_id: Dict[str, int] = {}
     kept_by_termination: Dict[str, int] = {}
     kept_by_sample_kind: Dict[str, int] = {}
+    kepler_games = 0
+    stockfish_selfplay_games = 0
 
     def bump(hist: Dict[str, int], key: str) -> None:
         hist[key] = hist.get(key, 0) + 1
@@ -342,6 +372,11 @@ def generate_teacher_data(
                         break
                     board.push(rng.choice(legal))
 
+                game_uses_kepler = rng.random() < max(0.0, min(1.0, kepler_game_fraction))
+                if game_uses_kepler:
+                    kepler_games += 1
+                else:
+                    stockfish_selfplay_games += 1
                 kepler_white = ((g - 1) % 2 == 0)
                 samples: List[Tuple[str, bool, int, int, str, int, str]] = []
 
@@ -353,13 +388,18 @@ def generate_teacher_data(
                         and tactical_sampleevery > 0
                         and (ply % tactical_sampleevery) == 0
                     )
-                    tactical = is_tactical_position(board) if (regular_due or tactical_due) else False
-                    if regular_due or (tactical_due and tactical):
+                    tactical_prefilter = (
+                        is_tactical_position(board) if (regular_due or tactical_due) else False
+                    )
+                    if regular_due or (tactical_due and tactical_prefilter):
                         info = sf_label.analyse(board, analyze_limit)
                         pov = info.get("score")
                         if pov is not None:
                             cp = pov.pov(board.turn).score(mate_score=20000)
                             if cp is not None:
+                                pv = info.get("pv", [])
+                                best_move = pv[0] if pv else None
+                                tactical = is_tactical_position(board, best_move)
                                 fen = board.fen()
                                 cp_stm = int(cp)
                                 considered += 1
@@ -385,7 +425,10 @@ def generate_teacher_data(
                                 else:
                                     bump(filtered_by_reason, reason)
 
-                    mover = kepler if (board.turn == chess.WHITE) == kepler_white else sf_play
+                    use_kepler = game_uses_kepler and (
+                        (board.turn == chess.WHITE) == kepler_white
+                    )
+                    mover = kepler if use_kepler else sf_play
                     play = mover.play(board, play_limit)
                     if play.move is None or play.move not in board.legal_moves:
                         break
@@ -420,7 +463,9 @@ def generate_teacher_data(
                 print(
                     f"[cycle] teacher game {g}/{games} result "
                     f"{'1-0' if white_result > 0 else ('0-1' if white_result < 0 else '1/2-1/2')} "
-                    f"samples={len(samples)}",
+                    f"samples={len(samples)} written={written} "
+                    f"elapsed_s={int(time.monotonic() - started_at)} "
+                    f"eta_s={int((time.monotonic() - started_at) / g * (games - g))}",
                     flush=True,
                 )
 
@@ -437,6 +482,8 @@ def generate_teacher_data(
         "kept_by_opening_id": kept_by_opening_id,
         "kept_by_termination": kept_by_termination,
         "kept_by_sample_kind": kept_by_sample_kind,
+        "kepler_games": kepler_games,
+        "stockfish_selfplay_games": stockfish_selfplay_games,
     }
 
 
@@ -541,10 +588,22 @@ def main() -> None:
     ap.add_argument("--teacher-play-elo", type=int, default=3000, help="Stockfish play Elo in limited teacher mode. Ignored in full mode.")
     ap.add_argument("--teacher-label-elo", type=int, default=0, help="Stockfish label Elo in teacher mode. Use 0 for max strength.")
     ap.add_argument("--teacher-analyze-ms", type=int, default=30, help="Label analysis time per sampled position (ms).")
+    ap.add_argument(
+        "--teacher-analyze-nodes",
+        type=int,
+        default=0,
+        help="Fixed Stockfish nodes per label; when >0 this overrides --teacher-analyze-ms.",
+    )
     ap.add_argument("--kepler-hash", type=int, default=64, help="Kepler hash in teacher mode.")
     ap.add_argument("--kepler-threads", type=int, default=1, help="Kepler threads in teacher mode.")
     ap.add_argument("--teacher-hash", type=int, default=64, help="Stockfish hash in teacher mode.")
     ap.add_argument("--teacher-threads", type=int, default=1, help="Stockfish threads in teacher mode.")
+    ap.add_argument(
+        "--teacher-kepler-game-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of teacher games using Kepler on one side; the rest are Stockfish self-play.",
+    )
     ap.add_argument("--trainer-arch", choices=["psqt", "halfkp"], default="halfkp", help="Trainer architecture.")
     ap.add_argument("--trainer-hidden-size", type=int, default=1536, help="Trainer hidden size.")
     ap.add_argument("--trainer-epochs", type=int, default=80, help="Trainer epochs.")
@@ -624,10 +683,12 @@ def main() -> None:
                 play_elo=args.teacher_play_elo,
                 label_elo=args.teacher_label_elo,
                 analyze_ms=max(1, args.teacher_analyze_ms),
+                analyze_nodes=max(0, args.teacher_analyze_nodes),
                 kepler_hash=max(1, args.kepler_hash),
                 kepler_threads=max(1, args.kepler_threads),
                 sf_hash=max(1, args.teacher_hash),
                 sf_threads=max(1, args.teacher_threads),
+                kepler_game_fraction=max(0.0, min(1.0, args.teacher_kepler_game_fraction)),
             )
             print(
                 f"[cycle] teacher done: games={sp['games']} written={sp['written']} "
@@ -672,7 +733,9 @@ def main() -> None:
         generation_summary = {
             "run_id": run_id,
             "engine": str(engine),
+            "engine_sha256": sha256_file(engine),
             "stockfish": str(stockfish),
+            "stockfish_sha256": sha256_file(stockfish),
             "data_path": str(data_path),
             "games": sp.get("games", 0),
             "written": sp.get("written", 0),
@@ -680,7 +743,32 @@ def main() -> None:
             "samples_filtered": sp.get("samples_filtered", 0),
             "kept_by_score_bucket": sp.get("kept_by_score_bucket", {}),
             "kept_by_sample_kind": sp.get("kept_by_sample_kind", {}),
+            "kepler_games": sp.get("kepler_games", 0),
+            "stockfish_selfplay_games": sp.get("stockfish_selfplay_games", 0),
             "seed": args.seed,
+            "settings": {
+                "datagen_mode": args.datagen_mode,
+                "games": args.games,
+                "movetime_ms": args.movetime,
+                "maxply": args.maxply,
+                "randomplies": args.randomplies,
+                "sampleevery": args.sampleevery,
+                "tactical_sampleevery": args.tactical_sampleevery,
+                "minsampleply": args.minsampleply,
+                "filter_min_ply": args.filter_min_ply,
+                "filter_max_ply": args.filter_max_ply,
+                "filter_max_abs_score_cp": args.filter_max_abs_score_cp,
+                "teacher_play_mode": args.teacher_play_mode,
+                "teacher_play_elo": args.teacher_play_elo,
+                "teacher_label_elo": args.teacher_label_elo,
+                "teacher_analyze_ms": args.teacher_analyze_ms,
+                "teacher_analyze_nodes": args.teacher_analyze_nodes,
+                "teacher_kepler_game_fraction": args.teacher_kepler_game_fraction,
+                "kepler_hash": args.kepler_hash,
+                "kepler_threads": args.kepler_threads,
+                "teacher_hash": args.teacher_hash,
+                "teacher_threads": args.teacher_threads,
+            },
         }
         summary_path.write_text(json.dumps(generation_summary, indent=2) + "\n", encoding="utf-8")
         print(f"[cycle] generation summary -> {summary_path}")
@@ -799,10 +887,12 @@ def main() -> None:
             "teacher_play_elo": args.teacher_play_elo,
             "teacher_label_elo": args.teacher_label_elo,
             "teacher_analyze_ms": args.teacher_analyze_ms,
+            "teacher_analyze_nodes": args.teacher_analyze_nodes,
             "kepler_hash": args.kepler_hash,
             "kepler_threads": args.kepler_threads,
             "teacher_hash": args.teacher_hash,
             "teacher_threads": args.teacher_threads,
+            "teacher_kepler_game_fraction": args.teacher_kepler_game_fraction,
             "seed": args.seed,
             "written": sp["written"],
             "samples_considered": sp.get("samples_considered", 0),

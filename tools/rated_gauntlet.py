@@ -232,16 +232,18 @@ def fit_rating(games: Sequence[GameResult]) -> Dict[str, Any]:
 
 
 def configure_kepler(engine: chess.engine.SimpleEngine, args: argparse.Namespace) -> None:
-    engine.configure(
-        {
-            "Hash": max(1, args.hash),
-            "Threads": max(1, args.threads),
-            "Contempt": max(-100, min(100, args.contempt)),
-            "UseBaseline": False if args.eval_model else True,
-            "BaselineEvalFile": str(args.baseline_model),
-            "EvalFile": str(args.eval_model) if args.eval_model else "",
-        }
-    )
+    options = {
+        "Hash": max(1, args.hash),
+        "Threads": max(1, args.threads),
+        "Contempt": max(-100, min(100, args.contempt)),
+        "NNUEWeight": max(0, min(100, getattr(args, "nnue_weight", 25))),
+        "NNUEClamp": max(0, min(10000, getattr(args, "nnue_clamp", 300))),
+        "UseBaseline": False if args.eval_model else True,
+        "BaselineEvalFile": str(args.baseline_model),
+    }
+    if args.eval_model:
+        options["EvalFile"] = str(args.eval_model)
+    engine.configure(options)
 
 
 def configure_opponent(
@@ -676,6 +678,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=1, help="Kepler search threads.")
     parser.add_argument("--opponent-threads", type=int, default=1)
     parser.add_argument("--contempt", type=int, default=0)
+    parser.add_argument("--nnue-weight", type=int, default=25, help="Neural share of evaluation, 0-100.")
+    parser.add_argument("--nnue-clamp", type=int, default=300, help="Maximum NNUE/classical difference; 0 disables.")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic opening/color seed.")
     parser.add_argument(
         "--audit-samples",

@@ -31,12 +31,26 @@ class NnueAbSprtTests(unittest.TestCase):
         self.assertEqual(sprt.sprt_decision(lower - 0.01, lower, upper), "reject_candidate")
         self.assertEqual(sprt.sprt_decision(upper + 0.01, lower, upper), "accept_candidate")
         self.assertEqual(sprt.sprt_decision(0.0, lower, upper), "continue")
+        self.assertEqual(
+            sprt.paired_sprt_decision(9, 8, upper + 1.0, lower, upper), "continue"
+        )
+        self.assertEqual(
+            sprt.paired_sprt_decision(10, 8, upper + 1.0, lower, upper),
+            "accept_candidate",
+        )
 
     def test_candidate_score_respects_color(self):
         self.assertEqual(sprt.candidate_score("1-0", True), ("win", 1.0))
         self.assertEqual(sprt.candidate_score("1-0", False), ("loss", 0.0))
         self.assertEqual(sprt.candidate_score("0-1", False), ("win", 1.0))
         self.assertEqual(sprt.candidate_score("1/2-1/2", True), ("draw", 0.5))
+
+    def test_candidate_configuration_persists_custom_model(self):
+        options = sprt.kepler_options(0, 0, Path("/tmp/candidate.nnue"), 75, 0)
+        self.assertFalse(options["UseBaseline"])
+        self.assertEqual(options["EvalFile"], "/tmp/candidate.nnue")
+        self.assertEqual(options["NNUEWeight"], 75)
+        self.assertEqual(options["NNUEClamp"], 0)
 
 
 if __name__ == "__main__":

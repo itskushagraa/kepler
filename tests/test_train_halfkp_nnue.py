@@ -45,6 +45,13 @@ class HalfKPTrainingTests(unittest.TestCase):
         self.assertFalse(nnue_cycle.is_tactical_position(chess.Board()))
         checked = chess.Board("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1")
         self.assertTrue(nnue_cycle.is_tactical_position(checked))
+        capture = chess.Board("4k3/8/8/8/8/8/4q3/4R1K1 w - - 0 1")
+        self.assertTrue(
+            nnue_cycle.is_tactical_position(capture, chess.Move.from_uci("e1e2"))
+        )
+        self.assertFalse(
+            nnue_cycle.is_tactical_position(chess.Board(), chess.Move.from_uci("e2e4"))
+        )
 
 
 if __name__ == "__main__":

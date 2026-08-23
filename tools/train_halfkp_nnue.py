@@ -6,14 +6,16 @@ The trainer mirrors ``src/nnue.cpp`` exactly:
     score = bias + V * clipped_relu(b + W * features_for_us)
                   - V * clipped_relu(b + W * features_for_them)
 
-Validation is grouped by complete games, the selected output is the epoch
-with the best held-out RMSE, and training can stop when that metric no longer
-improves. Current teacher data appends game_id and sample_kind columns after
-the existing result, score, FEN, ply, bucket, opening, and termination fields.
-Legacy files infer contiguous game groups from their increasing ply column.
+Validation is grouped by complete games (or supplied as a separately curated
+game split), the selected output is the epoch with the best held-out RMSE, and
+training can stop when that metric no longer improves. Current teacher data
+appends game_id and sample_kind columns after the existing result, score, FEN,
+ply, bucket, opening, and termination fields. Legacy files infer contiguous
+game groups from their increasing ply column.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -40,6 +42,14 @@ class HalfKPSample:
     target: float
     group: str
     kind: str = "regular"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def halfkp_index(king_sq: int, perspective: int, piece: int, sq: int) -> int:
@@ -169,10 +179,19 @@ def predict(
     output_bias: float,
     us_features: np.ndarray,
     them_features: np.ndarray,
+    batch_size: int = 1024,
 ) -> np.ndarray:
-    us_hidden = np.maximum(hidden_values(feature_weights, hidden_bias, us_features), 0.0)
-    them_hidden = np.maximum(hidden_values(feature_weights, hidden_bias, them_features), 0.0)
-    return (us_hidden - them_hidden) @ output_weights + output_bias
+    prediction = np.empty(len(us_features), dtype=np.float32)
+    for start in range(0, len(us_features), max(1, batch_size)):
+        stop = min(len(us_features), start + max(1, batch_size))
+        us_hidden = np.maximum(
+            hidden_values(feature_weights, hidden_bias, us_features[start:stop]), 0.0
+        )
+        them_hidden = np.maximum(
+            hidden_values(feature_weights, hidden_bias, them_features[start:stop]), 0.0
+        )
+        prediction[start:stop] = (us_hidden - them_hidden) @ output_weights + output_bias
+    return prediction
 
 
 def weighted_rmse(prediction: np.ndarray, target: np.ndarray, weights: np.ndarray) -> float:
@@ -260,25 +279,29 @@ def train(
             grad_them[them_pre <= 0.0] = 0.0
             grad_hidden_bias = np.sum(grad_us + grad_them, axis=0) * scale
 
-            grad_weights = np.zeros_like(feature_weights)
-            np.add.at(
-                grad_weights,
-                us_idx[us_mask],
-                np.repeat(grad_us[:, None, :], us_idx.shape[1], axis=1)[us_mask] * scale,
+            feature_indexes = np.concatenate((us_idx[us_mask], them_idx[them_mask]))
+            feature_gradients = np.concatenate(
+                (
+                    np.broadcast_to(grad_us[:, None, :], (*us_idx.shape, hidden_size))[us_mask],
+                    np.broadcast_to(grad_them[:, None, :], (*them_idx.shape, hidden_size))[them_mask],
+                )
             )
-            np.add.at(
-                grad_weights,
-                them_idx[them_mask],
-                np.repeat(grad_them[:, None, :], them_idx.shape[1], axis=1)[them_mask] * scale,
+            feature_order = np.argsort(feature_indexes, kind="stable")
+            sorted_indexes = feature_indexes[feature_order]
+            group_starts = np.concatenate(
+                ([0], np.flatnonzero(sorted_indexes[1:] != sorted_indexes[:-1]) + 1)
             )
-            touched = np.unique(np.concatenate((us_idx[us_mask], them_idx[them_mask])))
-            grad_weights[touched] += ridge * feature_weights[touched]
+            touched = sorted_indexes[group_starts]
+            grad_touched = np.add.reduceat(
+                feature_gradients[feature_order], group_starts, axis=0
+            ) * scale
+            grad_touched += ridge * feature_weights[touched]
 
             step += 1
             correction1 = 1.0 - beta1**step
             correction2 = 1.0 - beta2**step
-            mw = beta1 * mw + (1.0 - beta1) * grad_weights
-            vw = beta2 * vw + (1.0 - beta2) * np.square(grad_weights)
+            mw[touched] = beta1 * mw[touched] + (1.0 - beta1) * grad_touched
+            vw[touched] = beta2 * vw[touched] + (1.0 - beta2) * np.square(grad_touched)
             mb = beta1 * mb + (1.0 - beta1) * grad_hidden_bias
             vb = beta2 * vb + (1.0 - beta2) * np.square(grad_hidden_bias)
             mo = beta1 * mo + (1.0 - beta1) * grad_output
@@ -286,8 +309,8 @@ def train(
             m_out_bias = beta1 * m_out_bias + (1.0 - beta1) * grad_output_bias
             v_out_bias = beta2 * v_out_bias + (1.0 - beta2) * grad_output_bias**2
 
-            feature_weights -= learning_rate * (mw / correction1) / (
-                np.sqrt(vw / correction2) + epsilon
+            feature_weights[touched] -= learning_rate * (mw[touched] / correction1) / (
+                np.sqrt(vw[touched] / correction2) + epsilon
             )
             hidden_bias -= learning_rate * (mb / correction1) / (
                 np.sqrt(vb / correction2) + epsilon
@@ -299,8 +322,14 @@ def train(
                 math.sqrt(v_out_bias / correction2) + epsilon
             )
 
+        monitor_count = min(len(train_us), 10000)
         train_prediction = predict(
-            feature_weights, hidden_bias, output_weights, output_bias, train_us, train_them
+            feature_weights,
+            hidden_bias,
+            output_weights,
+            output_bias,
+            train_us[:monitor_count],
+            train_them[:monitor_count],
         )
         validation_prediction = predict(
             feature_weights,
@@ -310,7 +339,11 @@ def train(
             validation_us,
             validation_them,
         )
-        train_error = weighted_rmse(train_prediction, train_targets, train_weights)
+        train_error = weighted_rmse(
+            train_prediction,
+            train_targets[:monitor_count],
+            train_weights[:monitor_count],
+        )
         validation_error = weighted_rmse(
             validation_prediction, validation_targets, validation_weights
         )
@@ -360,7 +393,7 @@ def quantize(
     train_us: np.ndarray,
     train_them: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    sample_count = min(len(train_us), 4096)
+    sample_count = min(len(train_us), 1024)
     us_pre = hidden_values(feature_weights, hidden_bias, train_us[:sample_count])
     them_pre = hidden_values(feature_weights, hidden_bias, train_them[:sample_count])
     positive = np.maximum(np.concatenate((us_pre.reshape(-1), them_pre.reshape(-1))), 0.0)
@@ -391,13 +424,17 @@ def quantized_predict(
 ) -> np.ndarray:
     feature_i32 = feature_q.astype(np.int32)
     hidden_i32 = hidden_q.astype(np.int32)
-    us = np.clip(hidden_values(feature_i32, hidden_i32, us_features), 0, 255)
-    them = np.clip(hidden_values(feature_i32, hidden_i32, them_features), 0, 255)
     hidden_size = len(hidden_q)
     first = output_q[:hidden_size].astype(np.int64)
     second = output_q[hidden_size:].astype(np.int64)
-    raw = us.astype(np.int64) @ first + them.astype(np.int64) @ second + output_bias_q
-    return raw.astype(np.float64) / scale
+    prediction = np.empty(len(us_features), dtype=np.float64)
+    for start in range(0, len(us_features), 1024):
+        stop = min(len(us_features), start + 1024)
+        us = np.clip(hidden_values(feature_i32, hidden_i32, us_features[start:stop]), 0, 255)
+        them = np.clip(hidden_values(feature_i32, hidden_i32, them_features[start:stop]), 0, 255)
+        raw = us.astype(np.int64) @ first + them.astype(np.int64) @ second + output_bias_q
+        prediction[start:stop] = raw.astype(np.float64) / scale
+    return prediction
 
 
 def write_numpy_model(
@@ -423,6 +460,11 @@ def write_numpy_model(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a nonlinear HalfKP KNNUE model.")
     parser.add_argument("--data", required=True, help="TSV path: result<TAB>score<TAB>fen...")
+    parser.add_argument(
+        "--validation-data",
+        default="",
+        help="Optional separately curated validation TSV with disjoint game IDs.",
+    )
     parser.add_argument("--out", required=True, help="Best-validation .nnue output path.")
     parser.add_argument("--metrics-out", default="", help="Defaults to OUT.metrics.json.")
     parser.add_argument("--hidden-size", type=int, default=64)
@@ -444,12 +486,26 @@ def main() -> None:
     samples = parse_samples(args.data, args.result_weight, args.cp_scale, args.target_cp)
     if not samples:
         raise SystemExit("No valid HalfKP rows found in data file.")
-    try:
-        train_samples, validation_samples, train_groups, validation_groups = split_samples_by_group(
-            samples, args.validation_split, args.seed
+    if args.validation_data:
+        train_samples = samples
+        validation_samples = parse_samples(
+            args.validation_data, args.result_weight, args.cp_scale, args.target_cp
         )
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+        if not validation_samples:
+            raise SystemExit("No valid HalfKP rows found in validation data file.")
+        train_groups = sorted({sample.group for sample in train_samples})
+        validation_groups = sorted({sample.group for sample in validation_samples})
+        overlap = set(train_groups) & set(validation_groups)
+        if overlap:
+            examples = ", ".join(sorted(overlap)[:3])
+            raise SystemExit(f"training/validation game leakage detected: {examples}")
+    else:
+        try:
+            train_samples, validation_samples, train_groups, validation_groups = split_samples_by_group(
+                samples, args.validation_split, args.seed
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
 
     train_us, train_them = padded_features(train_samples)
     validation_us, validation_them = padded_features(validation_samples)
@@ -515,7 +571,15 @@ def main() -> None:
         "arch": "halfkp-dense",
         "input_size": HALFKP_INPUT_SIZE,
         "hidden_size": hidden_size,
-        "samples": len(samples),
+        "samples": len(train_samples) + len(validation_samples),
+        "training_data": str(Path(args.data).resolve()),
+        "training_data_sha256": sha256_file(Path(args.data).resolve()),
+        "validation_data": (
+            str(Path(args.validation_data).resolve()) if args.validation_data else "grouped split"
+        ),
+        "validation_data_sha256": (
+            sha256_file(Path(args.validation_data).resolve()) if args.validation_data else None
+        ),
         "training_samples": len(train_samples),
         "validation_samples": len(validation_samples),
         "training_groups": len(train_groups),
@@ -526,6 +590,7 @@ def main() -> None:
         "epochs_completed": trained["epochs_completed"],
         "early_stopped": trained["early_stopped"],
         "optimizer_steps": trained["optimizer_steps"],
+        "epoch_training_monitor_samples": min(len(train_samples), 10000),
         "train_rmse": train_error,
         "validation_rmse": validation_error,
         "quantized_train_rmse": quantized_train_error,
@@ -533,6 +598,7 @@ def main() -> None:
         "quant_scale": scale,
         "history": trained["history"],
         "output": str(output_path),
+        "output_sha256": sha256_file(output_path),
     }
     metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
 

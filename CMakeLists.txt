@@ -84,3 +84,28 @@ target_include_directories(eval_consistency PRIVATE src)
 add_test(
     NAME eval_incremental_consistency
     COMMAND eval_consistency "${CMAKE_CURRENT_SOURCE_DIR}/models/kepler_baseline_pst_v1.nnue")
+
+add_executable(eval_blend
+    tests/eval_blend.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+)
+target_include_directories(eval_blend PRIVATE src)
+add_test(
+    NAME eval_blend_configuration
+    COMMAND eval_blend "${CMAKE_CURRENT_SOURCE_DIR}/models/kepler_baseline_pst_v1.nnue")
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME uci_model_persistence
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/uci_model_persistence.py"
+                "$<TARGET_FILE:kepler>"
+                "$<TARGET_FILE:nnue_tool>"
+                "${CMAKE_CURRENT_BINARY_DIR}/uci_persistence_test.nnue"
+                "${CMAKE_CURRENT_SOURCE_DIR}/models/kepler_baseline_pst_v1.nnue")
+endif()

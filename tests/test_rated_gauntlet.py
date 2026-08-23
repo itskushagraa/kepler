@@ -50,6 +50,35 @@ def benchmark_args(mode):
 
 
 class RatedGauntletTests(unittest.TestCase):
+    def test_kepler_candidate_configuration_persists_eval_file(self):
+        engine = FakeEngine()
+        args = argparse.Namespace(
+            hash=64,
+            threads=2,
+            contempt=0,
+            eval_model=Path("/tmp/candidate.nnue"),
+            baseline_model=Path("/tmp/baseline.nnue"),
+            nnue_weight=50,
+            nnue_clamp=0,
+        )
+        gauntlet.configure_kepler(engine, args)
+        self.assertFalse(engine.configured["UseBaseline"])
+        self.assertEqual(engine.configured["EvalFile"], "/tmp/candidate.nnue")
+        self.assertEqual(engine.configured["NNUEWeight"], 50)
+
+    def test_kepler_baseline_configuration_omits_empty_eval_file(self):
+        engine = FakeEngine()
+        args = argparse.Namespace(
+            hash=64,
+            threads=1,
+            contempt=0,
+            eval_model="",
+            baseline_model=Path("/tmp/baseline.nnue"),
+        )
+        gauntlet.configure_kepler(engine, args)
+        self.assertTrue(engine.configured["UseBaseline"])
+        self.assertNotIn("EvalFile", engine.configured)
+
     def test_full_mode_forces_limiter_off(self):
         engine = FakeEngine()
         spec = gauntlet.OpponentSpec("Stockfish", Path("/tmp/stockfish"), options={"UCI_Elo": 1200})

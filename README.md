@@ -73,6 +73,11 @@ position startpos
 go movetime 1000
 ```
 
+`NNUEWeight` controls the neural share from 0–100 (default 25).
+`NNUEClamp` limits how far NNUE may differ from classical evaluation (default
+300 centipawns); set it to 0 to disable the clamp. Loading a non-empty
+`EvalFile` selects that model persistently across `ucinewgame`.
+
 Syzygy probing is optional. Place Fathom’s `tbprobe.h` and `tbprobe.c` under
 `external/fathom/`, then configure with `-DKEPLER_SYZYGY=ON`.
 
@@ -88,68 +93,74 @@ python3 tools/nnue_cycle.py \
   --engine build-release/kepler \
   --stockfish stockfish \
   --workdir /tmp/kepler_cycle \
-  --games 300 \
-  --movetime 12 \
+  --games 2000 \
+  --movetime 8 \
   --datagen-mode teacher \
-  --sampleevery 3 \
-  --tactical-sampleevery 2 \
+  --sampleevery 2 \
+  --tactical-sampleevery 1 \
   --teacher-play-mode limited \
-  --teacher-play-elo 2850 \
+  --teacher-play-elo 2600 \
   --teacher-label-elo 0 \
-  --teacher-analyze-ms 15 \
+  --teacher-analyze-nodes 10000 \
+  --teacher-kepler-game-fraction 0.5 \
   --filter-min-ply 12 \
   --filter-max-ply 120 \
   --filter-max-abs-score-cp 800
 ```
 
-### 2) Train NNUE (this will take a LONG time depending on what params you set for the step above)
+`teacher-analyze-nodes` makes labels reproducible across machines. Half of the
+example games contain Kepler and half are Stockfish self-play, preventing the
+corpus from consisting almost entirely of already-lost Kepler positions. Use
+different seeds and output directories to create independent shards.
+
+### 2) Curate and split the data
 
 ```bash
-python3 tools/train_bootstrap_nnue.py \
-  --data /tmp/kepler_data.tsv \
-  --out /tmp/kepler_bootstrap.nnue \
-  --arch halfkp \
-  --hidden-size 1536 \
-  --result-weight 0.4 \
-  --cp-scale 300 \
-  --target-cp 100 \
-  --ridge 0.5 \
-  --epochs 80
+python3 tools/curate_dataset.py \
+  --input /tmp/kepler_cycle_a/data_RUN_A.tsv \
+  --input /tmp/kepler_cycle_b/data_RUN_B.tsv \
+  --out-dir /tmp/kepler_curated \
+  --max-rows 100000 \
+  --tactical-fraction 0.4 \
+  --val-fraction 0.2 \
+  --seed 42
 ```
 
-The checked-in `models/kepler_baseline_pst_v1.nnue` is a small bootstrap PSQT
-model. It is useful as a stable fallback, but it is not a full-strength
-nonlinear HalfKP network. The legacy `train_bootstrap_nnue.py --arch halfkp`
-path is retained for reproducibility, but it is a sparse linear bootstrap and
-should not be confused with the nonlinear trainer below.
+The curator namespaces explicit game IDs across shards, removes duplicate
+positions while retaining side/castling/en-passant state, balances phase,
+score band, and regular/tactical samples, and splits only on complete games.
+Inspect `curation_manifest.json`; `game_leakage` must be empty.
 
-For the actual runtime-compatible nonlinear HalfKP candidate, train with
-NumPy:
+### 3) Train nonlinear HalfKP candidates
 
 ```bash
 python3 tools/train_halfkp_nnue.py \
-  --data /tmp/kepler_cycle/data_RUN_ID.tsv \
-  --out /tmp/kepler_halfkp_candidate.nnue \
+  --data /tmp/kepler_curated/train.tsv \
+  --validation-data /tmp/kepler_curated/validation.tsv \
+  --out /tmp/kepler_halfkp_h128.nnue \
   --hidden-size 128 \
   --epochs 80 \
-  --batch-size 128 \
+  --batch-size 256 \
   --result-weight 0.1 \
   --ridge 0.0003 \
-  --validation-split 0.2 \
-  --tactical-weight 1.25 \
+  --tactical-weight 1.0 \
   --patience 10
 ```
 
-Teacher rows include a game ID and regular/tactical sample kind. The trainer
-holds out complete games, stops when validation no longer improves, restores
-the best epoch, and reports both floating-point and quantized RMSE in
-`/tmp/kepler_halfkp_candidate.metrics.json`. Its two perspective accumulators
+Repeat with `--hidden-size 256` for the larger candidate. The checked-in
+`models/kepler_baseline_pst_v1.nnue` is a stable bootstrap PSQT fallback, not
+a full-strength nonlinear HalfKP network. The trainer rejects overlapping
+train/validation game IDs, stops when validation no longer improves, restores
+the best epoch, and reports floating-point and quantized RMSE in the adjacent
+metrics JSON. Its two perspective accumulators
 and ReLU placement match `src/nnue.cpp`. Validate the incremental path before
 playing games:
 
 ```bash
-./build-release/eval_consistency /tmp/kepler_halfkp_candidate.nnue
+./build-release/eval_consistency /tmp/kepler_halfkp_h128.nnue
 ```
+
+### 4) Select the model and blend by paired games
 
 For comparison against the current baseline, use the paired sequential test.
 It plays each opening twice with colors swapped and exits `0` only when the
@@ -161,15 +172,31 @@ python3 tools/nnue_ab_sprt.py \
   --engine build-release/kepler \
   --model-a models/kepler_baseline_pst_v1.nnue \
   --model-b /tmp/kepler_halfkp_candidate.nnue \
-  --games 64 \
+  --games 256 \
   --nodes 100000 \
   --threads 1 \
   --hash 128 \
   --elo0 0 \
-  --elo1 30 \
-  --draw-rate 0.35 \
+  --elo1 20 \
+  --draw-rate 0.8 \
   --pgn-out /tmp/kepler-halfkp-ab.pgn \
   --json-out /tmp/kepler-halfkp-ab.json
+```
+
+After selecting H128 or H256, sweep the blend with the same model on both
+sides. This tests 50% NNUE against 25%, with the classical-anchor clamp
+disabled for both:
+
+```bash
+python3 tools/nnue_ab_sprt.py \
+  --engine build-release/kepler \
+  --model-a /tmp/kepler_halfkp_h128.nnue \
+  --model-b /tmp/kepler_halfkp_h128.nnue \
+  --nnue-weight-a 25 --nnue-weight-b 50 \
+  --nnue-clamp-a 0 --nnue-clamp-b 0 \
+  --games 256 --nodes 100000 --draw-rate 0.8 \
+  --elo0 0 --elo1 20 \
+  --json-out /tmp/kepler-blend-25-vs-50.json
 ```
 
 The SPRT result is a promotion gate, not a claim of universal Elo. A model
@@ -191,7 +218,7 @@ The same paired runner can compare search binaries by adding `--engine-b` and
 using the same model for A and B. For fixed-position diagnostics, use
 `tools/search_quality.py` against a PGN before committing to a game match.
 
-### 3) Benchmark against full-strength Stockfish
+### 5) Benchmark against full-strength Stockfish
 
 ```bash
 python3 tools/rated_gauntlet.py \
@@ -286,8 +313,10 @@ TSV rows are:
 result<TAB>score<TAB>fen<TAB>...metadata
 ```
 
-Metadata columns (when enabled) include ply, score bucket, opening ID, and termination reason.  
-Training ignores extra columns after FEN.
+The current columns are result, Stockfish score from the side to move, FEN,
+ply, score bucket, opening ID, termination, game ID, and sample kind. Legacy
+trainers ignore metadata after FEN; the nonlinear HalfKP trainer uses game ID
+and sample kind.
 
 ---
 

@@ -2,10 +2,14 @@
 #include "movegen.hpp"
 #include "nnue.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 namespace
 {
+    std::atomic<int> gNnueWeight{25};
+    std::atomic<int> gNnueClamp{300};
+
     // Tuned-ish values and PSQT baseline adapted from a standard PeSTO-style eval.
     constexpr int kMgValue[6] = {82, 337, 365, 477, 1025, 0};
     constexpr int kEgValue[6] = {94, 281, 297, 512, 936, 0};
@@ -469,10 +473,38 @@ namespace
     }
 }
 
+void setNnueWeight(int percent)
+{
+    gNnueWeight.store(std::clamp(percent, 0, 100), std::memory_order_relaxed);
+}
+
+int nnueWeight()
+{
+    return gNnueWeight.load(std::memory_order_relaxed);
+}
+
+void setNnueClamp(int centipawns)
+{
+    gNnueClamp.store(std::clamp(centipawns, 0, 10000), std::memory_order_relaxed);
+}
+
+int nnueClamp()
+{
+    return gNnueClamp.load(std::memory_order_relaxed);
+}
+
 int evaluate(const Position &pos, bool *usedNnue)
 {
     const int classical = evaluateClassical(pos);
     const int classicalStm = (pos.sideToMove == WHITE) ? classical : -classical;
+
+    const int weight = nnueWeight();
+    if (weight == 0)
+    {
+        if (usedNnue)
+            *usedNnue = false;
+        return classicalStm;
+    }
 
     int nnueScore = 0;
     auto &acc = const_cast<Position &>(pos).nnueAccumulator;
@@ -481,10 +513,10 @@ int evaluate(const Position &pos, bool *usedNnue)
         if (usedNnue)
             *usedNnue = true;
 
-        // Keep NNUE in the loop but anchor to a stable classical signal
-        // while our current net is still bootstrapping.
-        int nnueClamped = std::clamp(nnueScore, classicalStm - 300, classicalStm + 300);
-        return (classicalStm * 3 + nnueClamped) / 4;
+        const int clampCp = nnueClamp();
+        if (clampCp > 0)
+            nnueScore = std::clamp(nnueScore, classicalStm - clampCp, classicalStm + clampCp);
+        return (classicalStm * (100 - weight) + nnueScore * weight) / 100;
     }
 
     if (usedNnue)

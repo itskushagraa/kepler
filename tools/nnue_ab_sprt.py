@@ -19,6 +19,7 @@ promotion gate.
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import random
@@ -30,6 +31,14 @@ import chess.engine
 import chess.pgn
 
 from nnue_ab import OPENINGS
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def result_probabilities(elo: float, draw_rate: float) -> Dict[str, float]:
@@ -77,6 +86,14 @@ def sprt_decision(llr: float, lower: float, upper: float) -> str:
     return "continue"
 
 
+def paired_sprt_decision(
+    games_played: int, minimum_games: int, llr: float, lower: float, upper: float
+) -> str:
+    if games_played < minimum_games or games_played % 2:
+        return "continue"
+    return sprt_decision(llr, lower, upper)
+
+
 def candidate_score(result: str, candidate_is_white: bool) -> Tuple[str, float]:
     if result == "1-0":
         score = 1.0 if candidate_is_white else 0.0
@@ -96,6 +113,19 @@ def choose_limit(args: argparse.Namespace) -> chess.engine.Limit:
     if args.depth is not None:
         return chess.engine.Limit(depth=max(1, args.depth))
     return chess.engine.Limit(nodes=100_000)
+
+
+def kepler_options(
+    hash_mb: int, threads: int, model: Path, nnue_weight: int, nnue_clamp: int
+) -> Dict[str, object]:
+    return {
+        "Hash": max(1, hash_mb),
+        "Threads": max(1, threads),
+        "NNUEWeight": max(0, min(100, nnue_weight)),
+        "NNUEClamp": max(0, min(10000, nnue_clamp)),
+        "UseBaseline": False,
+        "EvalFile": str(model),
+    }
 
 
 def apply_opening(opening: Sequence[str]) -> chess.Board:
@@ -180,6 +210,10 @@ def main() -> int:
     limit_group.add_argument("--depth", type=int, default=None)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--hash", type=int, default=128)
+    parser.add_argument("--nnue-weight-a", type=int, default=25)
+    parser.add_argument("--nnue-weight-b", type=int, default=25)
+    parser.add_argument("--nnue-clamp-a", type=int, default=300, help="0 disables the baseline clamp.")
+    parser.add_argument("--nnue-clamp-b", type=int, default=300, help="0 disables the candidate clamp.")
     parser.add_argument("--max-plies", type=int, default=200)
     parser.add_argument("--min-games", type=int, default=8, help="Do not stop before this many games.")
     parser.add_argument("--elo0", type=float, default=0.0)
@@ -197,8 +231,16 @@ def main() -> int:
         parser.error("--games must be an even number of paired games")
     if args.elo1 <= args.elo0:
         parser.error("--elo1 must be greater than --elo0")
-    if args.min_games < 2 or args.min_games > args.games:
-        parser.error("--min-games must be between 2 and --games")
+    if args.min_games < 2 or args.min_games > args.games or args.min_games % 2:
+        parser.error("--min-games must be even and between 2 and --games")
+    for option, value, maximum in (
+        ("--nnue-weight-a", args.nnue_weight_a, 100),
+        ("--nnue-weight-b", args.nnue_weight_b, 100),
+        ("--nnue-clamp-a", args.nnue_clamp_a, 10000),
+        ("--nnue-clamp-b", args.nnue_clamp_b, 10000),
+    ):
+        if value < 0 or value > maximum:
+            parser.error(f"{option} must be between 0 and {maximum}")
 
     engine_path = Path(args.engine).resolve()
     engine_b_path = Path(args.engine_b).resolve() if args.engine_b else engine_path
@@ -219,13 +261,20 @@ def main() -> int:
     decision = "continue"
     records: List[dict] = []
 
-    common_options = {"Hash": max(1, args.hash), "Threads": max(1, args.threads)}
     with (
         chess.engine.SimpleEngine.popen_uci(str(engine_path), timeout=args.timeout) as engine_a,
         chess.engine.SimpleEngine.popen_uci(str(engine_b_path), timeout=args.timeout) as engine_b,
     ):
-        engine_a.configure({**common_options, "EvalFile": str(model_a)})
-        engine_b.configure({**common_options, "EvalFile": str(model_b)})
+        engine_a.configure(
+            kepler_options(
+                args.hash, args.threads, model_a, args.nnue_weight_a, args.nnue_clamp_a
+            )
+        )
+        engine_b.configure(
+            kepler_options(
+                args.hash, args.threads, model_b, args.nnue_weight_b, args.nnue_clamp_b
+            )
+        )
 
         for game_index in range(args.games):
             pair_index = game_index // 2
@@ -266,8 +315,10 @@ def main() -> int:
             }
             records.append(record)
             games_played = game_index + 1
-            if games_played >= args.min_games:
-                decision = sprt_decision(llr, lower, upper)
+            # Never stop between the two color-swapped games of an opening.
+            decision = paired_sprt_decision(
+                games_played, args.min_games, llr, lower, upper
+            )
             record["SPRTDecision"] = decision
             print(
                 f"game {games_played}/{args.games} pair={pair_index + 1} "
@@ -290,8 +341,20 @@ def main() -> int:
         "status": decision,
         "baseline": str(model_a),
         "candidate": str(model_b),
+        "baseline_sha256": sha256_file(model_a),
+        "candidate_sha256": sha256_file(model_b),
         "baseline_engine": str(engine_path),
         "candidate_engine": str(engine_b_path),
+        "baseline_engine_sha256": sha256_file(engine_path),
+        "candidate_engine_sha256": sha256_file(engine_b_path),
+        "baseline_evaluation": {
+            "nnue_weight": args.nnue_weight_a,
+            "nnue_clamp": args.nnue_clamp_a,
+        },
+        "candidate_evaluation": {
+            "nnue_weight": args.nnue_weight_b,
+            "nnue_clamp": args.nnue_clamp_b,
+        },
         "games": total,
         "paired_games": total // 2,
         "baseline_wins": a_wins,

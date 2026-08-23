@@ -49,6 +49,8 @@ def main() -> None:
     parser.add_argument("--sf-nodes", type=int, default=500000)
     parser.add_argument("--hash", type=int, default=128)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--nnue-weight", type=int, default=25)
+    parser.add_argument("--nnue-clamp", type=int, default=300, help="0 disables the clamp.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--json-out", required=True)
     args = parser.parse_args()
@@ -75,7 +77,10 @@ def main() -> None:
         chess.engine.SimpleEngine.popen_uci(str(stockfish_path)) as stockfish,
     ):
         engine_options = dict(common)
+        engine_options["NNUEWeight"] = max(0, min(100, args.nnue_weight))
+        engine_options["NNUEClamp"] = max(0, min(10000, args.nnue_clamp))
         if args.model:
+            engine_options["UseBaseline"] = False
             engine_options["EvalFile"] = str(Path(args.model).resolve())
         engine.configure(engine_options)
         stockfish.configure({**common, "UCI_LimitStrength": False})

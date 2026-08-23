@@ -216,6 +216,8 @@ void runUciLoop()
             std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
             std::cout << "option name MoveOverhead type spin default 10 min 0 max 500\n";
             std::cout << "option name UsePruning type check default true\n";
+            std::cout << "option name NNUEWeight type spin default 25 min 0 max 100\n";
+            std::cout << "option name NNUEClamp type spin default 300 min 0 max 10000\n";
             std::cout << "option name EvalFile type string default <empty>\n";
             std::cout << "option name BaselineEvalFile type string default " << kDefaultBaselineEvalFile << "\n";
             std::cout << "option name UseBaseline type check default true\n";
@@ -293,9 +295,46 @@ void runUciLoop()
             {
                 usePruning = parseBool(value, usePruning);
             }
+            else if (name == "NNUEWeight")
+            {
+                int weight = nnueWeight();
+                try
+                {
+                    weight = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                }
+                setNnueWeight(weight);
+            }
+            else if (name == "NNUEClamp")
+            {
+                int clampCp = nnueClamp();
+                try
+                {
+                    clampCp = std::stoi(value);
+                }
+                catch (const std::exception &)
+                {
+                }
+                setNnueClamp(clampCp);
+            }
             else if (name == "EvalFile")
             {
-                loadEvalFile(value);
+                if (!value.empty())
+                {
+                    useBaseline = false;
+                    loadEvalFile(value);
+                }
+                else if (useBaseline)
+                {
+                    loadEvalFile(baselineEvalFile);
+                }
+                else
+                {
+                    Nnue::clear();
+                    Nnue::invalidate(pos.nnueAccumulator);
+                }
             }
             else if (name == "SyzygyPath")
             {
@@ -336,11 +375,15 @@ void runUciLoop()
             }
             else if (name == "UseBaseline")
             {
-                useBaseline = parseBool(value, useBaseline);
-                if (useBaseline)
-                    loadEvalFile(baselineEvalFile);
-                else
+                const bool requestedBaseline = parseBool(value, useBaseline);
+                if (requestedBaseline)
                 {
+                    useBaseline = true;
+                    loadEvalFile(baselineEvalFile);
+                }
+                else if (useBaseline)
+                {
+                    useBaseline = false;
                     Nnue::clear();
                     Nnue::invalidate(pos.nnueAccumulator);
                 }
@@ -348,22 +391,17 @@ void runUciLoop()
         }
         else if (cmd == "usebaseline")
         {
+            useBaseline = true;
             loadEvalFile(baselineEvalFile);
         }
         else if (cmd == "ucinewgame")
         {
             stopSearch();
             tt.clear();
-            if (useBaseline)
-            {
-                Nnue::loadFromFile(baselineEvalFile);
-                Nnue::invalidate(pos.nnueAccumulator);
-            }
-            else
-            {
-                Nnue::clear();
-                Nnue::invalidate(pos.nnueAccumulator);
-            }
+            // A new game resets search and position-derived state, not the
+            // selected evaluation model. EvalFile/UseBaseline are persistent
+            // UCI options and remain in force until explicitly changed.
+            Nnue::invalidate(pos.nnueAccumulator);
         }
         else if (cmd.rfind("position", 0) == 0)
         {
