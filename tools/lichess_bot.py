@@ -19,6 +19,7 @@ VENV_PYTHON = BRIDGE_DIR / ".venv" / "bin" / "python"
 CONFIG_PATH = REPO_ROOT / "deploy" / "lichess" / "config.yml"
 LOCK_PATH = REPO_ROOT / "deploy" / "lichess" / "requirements.lock.txt"
 SMOKE_PATH = REPO_ROOT / "tools" / "lichess_smoke.py"
+ACCOUNT_PATH = REPO_ROOT / "tools" / "lichess_account.py"
 ENGINE_PATH = REPO_ROOT / "build-release" / "kepler"
 TOKEN_ENV = "LICHESS_BOT_TOKEN"
 
@@ -85,13 +86,14 @@ def require_local_install() -> None:
         )
 
 
-def require_token() -> None:
+def require_token() -> str:
     token = os.environ.get(TOKEN_ENV, "").strip()
     if len(token) < 16 or token == "set-via-LICHESS_BOT_TOKEN":
         raise SystemExit(
             f"{TOKEN_ENV} is not set. Load the bot:play token into the environment; "
             "never put it in config.yml or a command-line argument."
         )
+    return token
 
 
 def smoke() -> None:
@@ -140,6 +142,14 @@ def command_run(args: argparse.Namespace) -> int:
     return bridge_command(["-v"] if args.verbose else [])
 
 
+def command_account(_: argparse.Namespace) -> int:
+    require_local_install()
+    require_token()
+    return subprocess.run(
+        [str(VENV_PYTHON), str(ACCOUNT_PATH)], cwd=BRIDGE_DIR, check=False
+    ).returncode
+
+
 def command_smoke(_: argparse.Namespace) -> int:
     smoke()
     return 0
@@ -173,6 +183,12 @@ def parser() -> argparse.ArgumentParser:
         "status", help="Show local deployment readiness without contacting Lichess."
     )
     status.set_defaults(func=command_status)
+
+    account = sub.add_parser(
+        "account",
+        help="Read the token's username, BOT scope, game count, and upgrade eligibility.",
+    )
+    account.set_defaults(func=command_account)
 
     smoke_parser = sub.add_parser(
         "smoke", help="Run the offline bridge and clock-management test."

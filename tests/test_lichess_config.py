@@ -13,6 +13,12 @@ SPEC = importlib.util.spec_from_file_location("kepler_lichess_bot", ROOT / "tool
 assert SPEC and SPEC.loader
 LICHESS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(LICHESS)
+ACCOUNT_SPEC = importlib.util.spec_from_file_location(
+    "kepler_lichess_account", ROOT / "tools" / "lichess_account.py"
+)
+assert ACCOUNT_SPEC and ACCOUNT_SPEC.loader
+ACCOUNT = importlib.util.module_from_spec(ACCOUNT_SPEC)
+ACCOUNT_SPEC.loader.exec_module(ACCOUNT)
 
 
 class LichessDeploymentTests(unittest.TestCase):
@@ -58,6 +64,25 @@ class LichessDeploymentTests(unittest.TestCase):
         args = LICHESS.argparse.Namespace(confirm_irreversible=False, verbose=False)
         with self.assertRaises(SystemExit):
             LICHESS.command_upgrade(args)
+
+    def test_account_check_only_allows_zero_game_or_existing_bot_accounts(self):
+        eligible, safe = ACCOUNT.summarize_profile(
+            {"username": "Kepler", "count": {"all": 0}}
+        )
+        self.assertTrue(safe)
+        self.assertEqual(eligible["upgrade_state"], "eligible_zero_games")
+
+        played, safe = ACCOUNT.summarize_profile(
+            {"username": "Kepler", "count": {"all": 1}}
+        )
+        self.assertFalse(safe)
+        self.assertEqual(played["upgrade_state"], "blocked_has_played_games")
+
+        existing, safe = ACCOUNT.summarize_profile(
+            {"username": "Kepler", "title": "BOT", "count": {"all": 12}}
+        )
+        self.assertTrue(safe)
+        self.assertEqual(existing["upgrade_state"], "already_bot")
 
 
 if __name__ == "__main__":

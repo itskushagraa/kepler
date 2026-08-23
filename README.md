@@ -110,10 +110,16 @@ Load it without writing it into shell history or the repository:
 ```bash
 read -s LICHESS_BOT_TOKEN
 export LICHESS_BOT_TOKEN
+python3 tools/lichess_bot.py account
 ```
 
-Converting an account to BOT status is irreversible. After checking the
-username and confirming it has zero games, run the one-time upgrade command:
+The read-only `account` command validates the `bot:play` scope and prints the
+selected username, title, game count, and upgrade state without exposing the
+token. Do not continue unless it reports the intended username and either
+`eligible_zero_games` or `already_bot`.
+
+Converting an account to BOT status is irreversible. After the account check
+confirms zero games, run the one-time upgrade command:
 
 ```bash
 python3 tools/lichess_bot.py upgrade --confirm-irreversible --verbose
