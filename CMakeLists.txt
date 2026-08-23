@@ -53,6 +53,34 @@ add_executable(perft
     src/nnue.cpp
 )
 target_include_directories(perft PRIVATE src)
+enable_testing()
+add_test(NAME perft_smoke COMMAND perft --smoke)
 
 add_executable(nnue_tool src/nnue_tool.cpp)
 target_include_directories(nnue_tool PRIVATE src)
+
+add_executable(search_budget
+    tests/search_budget.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/search.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+    src/tb.cpp
+)
+target_include_directories(search_budget PRIVATE src)
+add_test(NAME search_node_budget COMMAND search_budget)
+
+add_executable(eval_consistency
+    tests/eval_consistency.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+)
+target_include_directories(eval_consistency PRIVATE src)
+add_test(
+    NAME eval_incremental_consistency
+    COMMAND eval_consistency "${CMAKE_CURRENT_SOURCE_DIR}/models/kepler_baseline_pst_v1.nnue")

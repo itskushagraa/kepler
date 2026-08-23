@@ -1,0 +1,18 @@
+{
+  "engines": [
+    {"name": "Stockfish 1.6.2", "path": "/path/to/stockfish-1.6.2"},
+    {"name": "Stockfish 2.1", "path": "/path/to/stockfish-2.1"},
+    {"name": "Stockfish 8", "path": "/path/to/stockfish-8"},
+    {"name": "Stockfish 12", "path": "/path/to/stockfish-12"},
+    {"name": "Stockfish 15", "path": "/path/to/stockfish-15"},
+    {"name": "Stockfish 18", "path": "/path/to/stockfish-18"},
+    {
+      "name": "Kepler",
+      "path": "build-release/kepler",
+      "options": {
+        "BaselineEvalFile": "models/kepler_baseline_pst_v1.nnue",
+        "UseBaseline": true
+      }
+    }
+  ]
+}

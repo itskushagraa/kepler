@@ -54,6 +54,26 @@ def white_result_from_board(board: chess.Board) -> int:
     return 1 if outcome.winner == chess.WHITE else -1
 
 
+def is_tactical_position(board: chess.Board) -> bool:
+    """Identify forcing positions worth sampling more densely.
+
+    Checks, promotions, captures, and available checking moves are included.
+    This is intentionally a broad data-generation classifier; Stockfish still
+    supplies the target and the trainer applies the tactical sample weight.
+    """
+    if board.is_check():
+        return True
+    for move in list(board.legal_moves):
+        if move.promotion is not None or board.is_capture(move):
+            return True
+        board.push(move)
+        gives_check = board.is_check()
+        board.pop()
+        if gives_check:
+            return True
+    return False
+
+
 def ply_from_fen(fen: str) -> Optional[int]:
     parts = fen.split()
     if len(parts) < 6:
@@ -116,6 +136,7 @@ def filter_dataset_file(
     kept_by_score_bucket: Dict[str, int] = {}
     kept_by_opening_id: Dict[str, int] = {}
     kept_by_termination: Dict[str, int] = {}
+    kept_by_sample_kind: Dict[str, int] = {}
 
     def bump(hist: Dict[str, int], key: str) -> None:
         hist[key] = hist.get(key, 0) + 1
@@ -143,9 +164,11 @@ def filter_dataset_file(
 
             opening_id = parts[5] if len(parts) > 5 and parts[5] else "unknown"
             termination_reason = parts[6] if len(parts) > 6 and parts[6] else "unknown"
+            sample_kind = parts[8] if len(parts) > 8 and parts[8] else "regular"
             bump(kept_by_score_bucket, score_bucket(score_cp_stm))
             bump(kept_by_opening_id, opening_id)
             bump(kept_by_termination, termination_reason)
+            bump(kept_by_sample_kind, sample_kind)
 
             dst.write(row + "\n")
             kept += 1
@@ -159,6 +182,7 @@ def filter_dataset_file(
         "kept_by_score_bucket": kept_by_score_bucket,
         "kept_by_opening_id": kept_by_opening_id,
         "kept_by_termination": kept_by_termination,
+        "kept_by_sample_kind": kept_by_sample_kind,
     }
 
 
@@ -250,11 +274,13 @@ def generate_teacher_data(
     maxply: int,
     randomplies: int,
     sampleevery: int,
+    tactical_sampleevery: int,
     minsampleply: int,
     seed: int,
     min_ply: int,
     max_ply: int,
     max_abs_score_cp: int,
+    play_mode: str,
     play_elo: int,
     label_elo: int,
     analyze_ms: int,
@@ -276,6 +302,7 @@ def generate_teacher_data(
     kept_by_score_bucket: Dict[str, int] = {}
     kept_by_opening_id: Dict[str, int] = {}
     kept_by_termination: Dict[str, int] = {}
+    kept_by_sample_kind: Dict[str, int] = {}
 
     def bump(hist: Dict[str, int], key: str) -> None:
         hist[key] = hist.get(key, 0) + 1
@@ -285,7 +312,7 @@ def generate_teacher_data(
             kepler.configure({"Hash": max(1, kepler_hash), "Threads": max(1, kepler_threads)})
 
             sf_play_cfg: Dict[str, object] = {"Hash": max(1, sf_hash), "Threads": max(1, sf_threads)}
-            if play_elo > 0:
+            if play_mode == "limited" and play_elo > 0:
                 sf_play_cfg["UCI_LimitStrength"] = True
                 sf_play_cfg["UCI_Elo"] = play_elo
             else:
@@ -316,11 +343,18 @@ def generate_teacher_data(
                     board.push(rng.choice(legal))
 
                 kepler_white = ((g - 1) % 2 == 0)
-                samples: List[Tuple[str, bool, int, int, str, int]] = []
+                samples: List[Tuple[str, bool, int, int, str, int, str]] = []
 
                 while len(board.move_stack) < maxply and not board.is_game_over(claim_draw=True):
                     ply = len(board.move_stack)
-                    if ply >= minsampleply and (ply % sampleevery) == 0:
+                    regular_due = ply >= minsampleply and (ply % sampleevery) == 0
+                    tactical_due = (
+                        ply >= minsampleply
+                        and tactical_sampleevery > 0
+                        and (ply % tactical_sampleevery) == 0
+                    )
+                    tactical = is_tactical_position(board) if (regular_due or tactical_due) else False
+                    if regular_due or (tactical_due and tactical):
                         info = sf_label.analyse(board, analyze_limit)
                         pov = info.get("score")
                         if pov is not None:
@@ -345,6 +379,7 @@ def generate_teacher_data(
                                             sample_ply,
                                             score_bucket(cp_stm),
                                             opening_id,
+                                            "tactical" if tactical else "regular",
                                         )
                                     )
                                 else:
@@ -369,20 +404,24 @@ def generate_teacher_data(
                 if outcome is not None and outcome.termination is not None:
                     termination_reason = outcome.termination.name.lower()
 
-                for fen, side_is_white, cp_stm, sample_ply, bucket, sample_opening_id in samples:
+                game_id = f"teacher-{seed}-{g}"
+                for fen, side_is_white, cp_stm, sample_ply, bucket, sample_opening_id, sample_kind in samples:
                     stm_result = white_result if side_is_white else -white_result
                     out.write(
-                        f"{stm_result}\t{cp_stm}\t{fen}\t{sample_ply}\t{bucket}\t{sample_opening_id}\t{termination_reason}\n"
+                        f"{stm_result}\t{cp_stm}\t{fen}\t{sample_ply}\t{bucket}\t{sample_opening_id}\t"
+                        f"{termination_reason}\t{game_id}\t{sample_kind}\n"
                     )
                     bump(kept_by_score_bucket, bucket)
                     bump(kept_by_opening_id, str(sample_opening_id))
                     bump(kept_by_termination, termination_reason)
+                    bump(kept_by_sample_kind, sample_kind)
                     written += 1
 
                 print(
                     f"[cycle] teacher game {g}/{games} result "
                     f"{'1-0' if white_result > 0 else ('0-1' if white_result < 0 else '1/2-1/2')} "
-                    f"samples={len(samples)}"
+                    f"samples={len(samples)}",
+                    flush=True,
                 )
 
     return {
@@ -397,6 +436,7 @@ def generate_teacher_data(
         "kept_by_score_bucket": kept_by_score_bucket,
         "kept_by_opening_id": kept_by_opening_id,
         "kept_by_termination": kept_by_termination,
+        "kept_by_sample_kind": kept_by_sample_kind,
     }
 
 
@@ -487,11 +527,18 @@ def main() -> None:
     ap.add_argument("--maxply", type=int, default=260, help="Selfplay max plies.")
     ap.add_argument("--randomplies", type=int, default=8, help="Random opening plies.")
     ap.add_argument("--sampleevery", type=int, default=2, help="Write one sample every N plies.")
+    ap.add_argument(
+        "--tactical-sampleevery",
+        type=int,
+        default=0,
+        help="Also sample forcing positions every N plies; 0 disables tactical oversampling.",
+    )
     ap.add_argument("--minsampleply", type=int, default=8, help="Do not sample before this ply.")
     ap.add_argument("--filter-min-ply", type=int, default=20, help="Keep samples with ply >= this value.")
     ap.add_argument("--filter-max-ply", type=int, default=60, help="Keep samples with ply <= this value.")
     ap.add_argument("--filter-max-abs-score-cp", type=int, default=200, help="Keep samples where |cp| <= this value. Set <0 to disable.")
-    ap.add_argument("--teacher-play-elo", type=int, default=3000, help="Stockfish play Elo in teacher mode. Use 0 for max strength.")
+    ap.add_argument("--teacher-play-mode", choices=["limited", "full"], default="limited", help="Teacher game mode; limited intentionally weakens Stockfish, full disables UCI_Elo limiting.")
+    ap.add_argument("--teacher-play-elo", type=int, default=3000, help="Stockfish play Elo in limited teacher mode. Ignored in full mode.")
     ap.add_argument("--teacher-label-elo", type=int, default=0, help="Stockfish label Elo in teacher mode. Use 0 for max strength.")
     ap.add_argument("--teacher-analyze-ms", type=int, default=30, help="Label analysis time per sampled position (ms).")
     ap.add_argument("--kepler-hash", type=int, default=64, help="Kepler hash in teacher mode.")
@@ -504,9 +551,14 @@ def main() -> None:
     ap.add_argument("--trainer-lr", type=float, default=0.08, help="Trainer learning rate.")
     ap.add_argument("--seed", type=int, default=42, help="Selfplay RNG seed.")
     ap.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="Generate/filter data and its summary without invoking a trainer.",
+    )
+    ap.add_argument(
         "--candidate",
         action="append",
-        required=True,
+        required=False,
         help="Candidate spec: name,result_weight,cp_scale,target_cp,ridge (repeatable).",
     )
     args = ap.parse_args()
@@ -521,12 +573,14 @@ def main() -> None:
 
     if not engine.exists():
         raise SystemExit(f"Engine not found: {engine}")
-    if not trainer.exists():
+    if not args.generate_only and not trainer.exists():
         raise SystemExit(f"Trainer not found: {trainer}")
     if not args.data and args.datagen_mode == "teacher" and not stockfish.exists():
         raise SystemExit(f"Stockfish not found: {args.stockfish}")
 
-    candidates = parse_candidates(args.candidate)
+    if not args.generate_only and not args.candidate:
+        raise SystemExit("At least one --candidate is required unless --generate-only is used.")
+    candidates = parse_candidates(args.candidate or [])
     data_path = Path(args.data).resolve() if args.data else (workdir / f"data_{run_id}.tsv")
     summary_path = workdir / f"summary_{run_id}.json"
     csv_path = workdir / f"results_{run_id}.csv"
@@ -560,11 +614,13 @@ def main() -> None:
                 maxply=max(20, args.maxply),
                 randomplies=max(0, args.randomplies),
                 sampleevery=max(1, args.sampleevery),
+                tactical_sampleevery=max(0, args.tactical_sampleevery),
                 minsampleply=max(0, args.minsampleply),
                 seed=args.seed,
                 min_ply=max(0, args.filter_min_ply),
                 max_ply=args.filter_max_ply,
                 max_abs_score_cp=args.filter_max_abs_score_cp,
+                play_mode=args.teacher_play_mode,
                 play_elo=args.teacher_play_elo,
                 label_elo=args.teacher_label_elo,
                 analyze_ms=max(1, args.teacher_analyze_ms),
@@ -611,6 +667,24 @@ def main() -> None:
             "Dataset is empty after filtering. Increase games or relax "
             "--filter-min-ply/--filter-max-ply/--filter-max-abs-score-cp."
         )
+
+    if args.generate_only:
+        generation_summary = {
+            "run_id": run_id,
+            "engine": str(engine),
+            "stockfish": str(stockfish),
+            "data_path": str(data_path),
+            "games": sp.get("games", 0),
+            "written": sp.get("written", 0),
+            "samples_considered": sp.get("samples_considered", 0),
+            "samples_filtered": sp.get("samples_filtered", 0),
+            "kept_by_score_bucket": sp.get("kept_by_score_bucket", {}),
+            "kept_by_sample_kind": sp.get("kept_by_sample_kind", {}),
+            "seed": args.seed,
+        }
+        summary_path.write_text(json.dumps(generation_summary, indent=2) + "\n", encoding="utf-8")
+        print(f"[cycle] generation summary -> {summary_path}")
+        return
 
     rows: List[Dict[str, object]] = []
     for c in candidates:
@@ -716,10 +790,12 @@ def main() -> None:
             "maxply": args.maxply,
             "randomplies": args.randomplies,
             "sampleevery": args.sampleevery,
+            "tactical_sampleevery": args.tactical_sampleevery,
             "minsampleply": args.minsampleply,
             "filter_min_ply": args.filter_min_ply,
             "filter_max_ply": args.filter_max_ply,
             "filter_max_abs_score_cp": args.filter_max_abs_score_cp,
+            "teacher_play_mode": args.teacher_play_mode,
             "teacher_play_elo": args.teacher_play_elo,
             "teacher_label_elo": args.teacher_label_elo,
             "teacher_analyze_ms": args.teacher_analyze_ms,
@@ -735,6 +811,7 @@ def main() -> None:
             "kept_by_score_bucket": sp.get("kept_by_score_bucket", {}),
             "kept_by_opening_id": sp.get("kept_by_opening_id", {}),
             "kept_by_termination": sp.get("kept_by_termination", {}),
+            "kept_by_sample_kind": sp.get("kept_by_sample_kind", {}),
             "data_path": str(data_path),
         },
         "results_csv": str(csv_path),

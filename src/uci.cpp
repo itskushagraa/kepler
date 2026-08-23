@@ -176,9 +176,14 @@ void runUciLoop()
     int searchThreads = 1;
     int contemptCp = 0;
     int moveOverheadMs = 10;
+    bool usePruning = true;
 
     auto loadEvalFile = [&](const std::string &path)
     {
+        // Accumulators contain sums of the currently loaded model's weights.
+        // They must not survive a model replacement, even when the board hash
+        // itself has not changed.
+        Nnue::invalidate(pos.nnueAccumulator);
         if (!path.empty() && Nnue::loadFromFile(path))
         {
             std::cout << "info string nnue loaded " << path << "\n";
@@ -210,6 +215,7 @@ void runUciLoop()
             std::cout << "option name Threads type spin default 1 min 1 max 128\n";
             std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
             std::cout << "option name MoveOverhead type spin default 10 min 0 max 500\n";
+            std::cout << "option name UsePruning type check default true\n";
             std::cout << "option name EvalFile type string default <empty>\n";
             std::cout << "option name BaselineEvalFile type string default " << kDefaultBaselineEvalFile << "\n";
             std::cout << "option name UseBaseline type check default true\n";
@@ -283,6 +289,10 @@ void runUciLoop()
                 }
                 moveOverheadMs = std::clamp(overhead, 0, 500);
             }
+            else if (name == "UsePruning")
+            {
+                usePruning = parseBool(value, usePruning);
+            }
             else if (name == "EvalFile")
             {
                 loadEvalFile(value);
@@ -329,6 +339,11 @@ void runUciLoop()
                 useBaseline = parseBool(value, useBaseline);
                 if (useBaseline)
                     loadEvalFile(baselineEvalFile);
+                else
+                {
+                    Nnue::clear();
+                    Nnue::invalidate(pos.nnueAccumulator);
+                }
             }
         }
         else if (cmd == "usebaseline")
@@ -340,7 +355,15 @@ void runUciLoop()
             stopSearch();
             tt.clear();
             if (useBaseline)
+            {
                 Nnue::loadFromFile(baselineEvalFile);
+                Nnue::invalidate(pos.nnueAccumulator);
+            }
+            else
+            {
+                Nnue::clear();
+                Nnue::invalidate(pos.nnueAccumulator);
+            }
         }
         else if (cmd.rfind("position", 0) == 0)
         {
@@ -790,6 +813,7 @@ void runUciLoop()
             SearchLimits actualLimits = limits;
             actualLimits.threads = searchThreads;
             actualLimits.contempt = contemptCp;
+            actualLimits.usePruning = usePruning;
             actualLimits.moveOverheadMs = moveOverheadMs;
             searchThread = std::thread([searchPos, actualLimits, &tt, &stopFlag, &searching]() mutable
                                        {

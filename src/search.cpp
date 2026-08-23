@@ -260,6 +260,7 @@ namespace
 
         return gain[0];
     }
+
 }
 
 void TranspositionTable::resizeMB(int mb)
@@ -377,6 +378,8 @@ struct SearchState
     };
 
     std::atomic<bool> *stopFlag = nullptr;
+    std::atomic<uint64_t> *sharedNodeCounter = nullptr;
+    uint64_t sharedNodeLimit = 0;
     TranspositionTable *tt = nullptr;
     uint64_t nodes = 0;
     uint64_t qnodes = 0;
@@ -386,6 +389,7 @@ struct SearchState
     int maxDepth = 0;
     int nodeLimit = 0;
     int contempt = 0;
+    bool usePruning = true;
     Side rootSide = WHITE;
     int workerId = 0;
     int killerMoves[MAX_PLY][2]{};
@@ -409,6 +413,31 @@ struct NullUndo
 uint64_t totalNodes(const SearchState &st)
 {
     return st.nodes + st.qnodes;
+}
+
+bool reserveSearchNode(SearchState &st)
+{
+    if (!st.sharedNodeCounter || st.sharedNodeLimit == 0)
+        return true;
+
+    uint64_t current = st.sharedNodeCounter->load(std::memory_order_relaxed);
+    while (current < st.sharedNodeLimit)
+    {
+        if (st.sharedNodeCounter->compare_exchange_weak(
+                current,
+                current + 1,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed))
+        {
+            if (current + 1 >= st.sharedNodeLimit && st.stopFlag)
+                st.stopFlag->store(true, std::memory_order_relaxed);
+            return true;
+        }
+    }
+
+    if (st.stopFlag)
+        st.stopFlag->store(true, std::memory_order_relaxed);
+    return false;
 }
 
 int elapsedMs(const SearchState &st)
@@ -548,7 +577,8 @@ int scoreMove(const Position &pos, const Move &m, const Move &ttMove, int ply, c
         int attacker = pos.pieceIndexAt(m.from);
         int victimVal = (captured >= 0) ? pieceValuesAbs[captured] : 100;
         int attackerVal = (attacker >= 0) ? pieceValuesAbs[attacker] : 100;
-        return 100000 + (victimVal * 12 - attackerVal);
+        const int mvvLva = victimVal * 12 - attackerVal;
+        return 100000 + mvvLva;
     }
 
     if (m.isPromotion)
@@ -614,6 +644,9 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
     if (shouldStop(st))
         return 0;
 
+    if (!reserveSearchNode(st))
+        return 0;
+
     if (ply >= MAX_PLY - 1)
         return evaluateCached(pos, st);
 
@@ -668,15 +701,17 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
         if (!inCheck && !(m.isCapture || m.isPromotion))
             continue;
 
+        int see = 0;
+        bool haveSee = false;
         if (!inCheck && m.isCapture && !m.isPromotion)
         {
-            if (staticExchangeEval(pos, m) < 0)
-                continue;
+            see = staticExchangeEval(pos, m);
+            haveSee = true;
         }
 
         if (!inCheck && m.isCapture)
         {
-            int captured = pos.pieceIndexAt(m.to);
+            int captured = capturedPieceAt(pos, m, us);
             int gain = (captured >= 0) ? pieceValuesAbs[captured] : 0;
             if (stand + gain + 120 < alpha)
                 continue;
@@ -692,6 +727,23 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
             pos.unmakeMove(m, u);
             continue;
         }
+
+        // Check whether a capture gives check before applying the losing-SEE
+        // filter.  Sacrificing checking captures can be forcing and must stay
+        // visible to quiescence.
+        bool givesCheck = false;
+        const int opponentKingSq = pos.kingSquare[them];
+        if (opponentKingSq != -1)
+            givesCheck = pos.isSquareAttacked(opponentKingSq, us);
+
+        // A losing capture can still be a forcing check or a mating
+        // sacrifice.  Only prune it after checking whether it gives check.
+        if (!inCheck && haveSee && see < 0 && !givesCheck)
+        {
+            pos.unmakeMove(m, u);
+            continue;
+        }
+
         legalMoves++;
         st.repHistory.push_back(pos.hashKey);
         int score = -quiescence(pos, st, -beta, -alpha, ply + 1);
@@ -713,6 +765,9 @@ int quiescence(Position &pos, SearchState &st, int alpha, int beta, int ply)
 int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int ply, bool allowNullMove = true)
 {
     if (shouldStop(st))
+        return 0;
+
+    if (!reserveSearchNode(st))
         return 0;
 
     if (ply >= MAX_PLY - 1)
@@ -790,7 +845,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
     bool haveStaticEval = false;
 
     // Reverse futility pruning for shallow, non-check, non-PV nodes.
-    if (depth <= 3 && !pvNode && !inCheck)
+    if (st.usePruning && depth <= 3 && !pvNode && !inCheck)
     {
         staticEval = evaluateCached(pos, st);
         haveStaticEval = true;
@@ -800,7 +855,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
     }
 
     // Null move pruning: try passing the move to prove a beta cutoff quickly.
-    if (allowNullMove && depth >= 3 && !inCheck && ply > 0 && hasNonPawnMaterial(pos, us))
+    if (st.usePruning && allowNullMove && depth >= 3 && !inCheck && ply > 0 && hasNonPawnMaterial(pos, us))
     {
         if (!haveStaticEval)
         {
@@ -891,7 +946,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
             givesCheck = pos.isSquareAttacked(oppKingSq, us);
 
         // Late move pruning (LMP): skip very late quiets at low depth.
-        if (!pvNode && !inCheck && !givesCheck && depth <= 3 && isQuiet)
+        if (st.usePruning && !pvNode && !inCheck && !givesCheck && depth <= 3 && isQuiet)
         {
             int lmpThreshold = 12 + 8 * depth + depth * depth; // depth1:21 depth2:32 depth3:45
             if (legalMoves > lmpThreshold)
@@ -901,7 +956,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
             }
         }
 
-        if (!pvNode && !inCheck && !givesCheck && isQuiet && depth <= 3 && legalMoves > 1)
+        if (st.usePruning && !pvNode && !inCheck && !givesCheck && isQuiet && depth <= 3 && legalMoves > 1)
         {
             if (!haveStaticEval)
             {
@@ -925,7 +980,7 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
         int score = 0;
         int nextDepth = depth - 1;
 
-        if (!pvNode && !inCheck && !givesCheck && depth <= 3 && haveSee && see < -(95 * depth))
+        if (st.usePruning && !pvNode && !inCheck && !givesCheck && depth <= 3 && haveSee && see < -(95 * depth))
         {
             st.moveStack[ply] = prevMoveStack;
             st.repHistory.pop_back();
@@ -1055,10 +1110,18 @@ int negamax(Position &pos, SearchState &st, int depth, int alpha, int beta, int 
     return bestScore;
 }
 
-SearchResult searchSingle(Position &pos, const SearchLimits &limits, TranspositionTable &tt, std::atomic<bool> &stopFlag, int workerId)
+SearchResult searchSingle(
+    Position &pos,
+    const SearchLimits &limits,
+    TranspositionTable &tt,
+    std::atomic<bool> &stopFlag,
+    int workerId,
+    std::atomic<uint64_t> *sharedNodeCounter)
 {
     SearchState st;
     st.stopFlag = &stopFlag;
+    st.sharedNodeCounter = sharedNodeCounter;
+    st.sharedNodeLimit = limits.nodes > 0 ? static_cast<uint64_t>(limits.nodes) : 0;
     st.tt = &tt;
     st.nodes = 0;
     st.qnodes = 0;
@@ -1068,6 +1131,7 @@ SearchResult searchSingle(Position &pos, const SearchLimits &limits, Transpositi
     st.maxDepth = limits.depth;
     st.nodeLimit = limits.nodes;
     st.contempt = limits.contempt;
+    st.usePruning = limits.usePruning;
     st.rootSide = pos.sideToMove;
     st.workerId = workerId;
     st.evalCache.assign(1u << 15, SearchState::EvalCacheEntry{});
@@ -1322,7 +1386,10 @@ SearchResult searchSingle(Position &pos, const SearchLimits &limits, Transpositi
         int score = 0;
         int alpha = -INF_SCORE;
         int beta = INF_SCORE;
-        int window = 25;
+        // A slightly wider initial window avoids repeated full root searches
+        // when tactical scores move by more than a quarter pawn between
+        // completed iterations.
+        int window = 50;
         int reSearches = 0;
         Move depthBestMove = result.bestMove;
 
@@ -1418,6 +1485,9 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
 {
     tt.newSearch();
 
+    std::atomic<uint64_t> sharedNodeCounter{0};
+    std::atomic<uint64_t> *sharedCounter = limits.nodes > 0 ? &sharedNodeCounter : nullptr;
+
     SearchLimits singleLimits = limits;
     singleLimits.threads = 1;
 
@@ -1428,7 +1498,7 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     threadCount = std::min(threadCount, 32);
 
     if (threadCount <= 1)
-        return searchSingle(pos, singleLimits, tt, stopFlag, 0);
+        return searchSingle(pos, singleLimits, tt, stopFlag, 0, sharedCounter);
 
     std::vector<SearchResult> workerResults(threadCount);
     std::vector<std::thread> workers;
@@ -1439,7 +1509,13 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
         Position localPos = pos;
         SearchLimits localLimits = singleLimits;
         localLimits.printInfo = (workerId == 0) ? limits.printInfo : false;
-        workerResults[workerId] = searchSingle(localPos, localLimits, tt, stopFlag, workerId);
+        workerResults[workerId] = searchSingle(
+            localPos,
+            localLimits,
+            tt,
+            stopFlag,
+            workerId,
+            sharedCounter);
     };
 
     for (int id = 1; id < threadCount; ++id)

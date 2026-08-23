@@ -19,6 +19,7 @@ struct SearchLimits
     int nodes = 0;
     int threads = 1;
     int contempt = 0;
+    bool usePruning = true;
     bool infinite = false;
     bool printInfo = true;
 };
