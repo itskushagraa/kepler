@@ -1,0 +1,89 @@
+# The real token is supplied only through LICHESS_BOT_TOKEN. Keeping this
+# placeholder in version control prevents credentials from entering the repo.
+token: "set-via-LICHESS_BOT_TOKEN"
+url: "https://lichess.org/"
+
+engine:
+  # lichess-bot runs from .local/lichess-bot, so these paths resolve back to
+  # the Kepler checkout without embedding a machine-specific absolute path.
+  dir: "../../build-release"
+  name: "kepler"
+  working_dir: "../.."
+  protocol: "uci"
+  debug: false
+  ponder: false
+  silence_stderr: false
+
+  draw_or_resign:
+    resign_enabled: false
+    offer_draw_enabled: false
+
+  polyglot:
+    enabled: false
+
+  online_moves:
+    max_retries: 2
+    chessdb_book:
+      enabled: false
+    lichess_cloud_analysis:
+      enabled: false
+    lichess_opening_explorer:
+      enabled: false
+    online_egtb:
+      enabled: false
+
+  lichess_bot_tbs:
+    syzygy:
+      enabled: false
+    gaviota:
+      enabled: false
+
+  uci_options:
+    Hash: 256
+    Threads: 4
+    MoveOverhead: 150
+    UseBaseline: true
+
+abort_time: 30
+move_overhead: 1500
+rate_limiting_delay: 100
+max_takebacks_accepted: 0
+quit_after_all_games_finish: true
+pgn_directory: "../../deploy/lichess/games"
+pgn_file_grouping: "all"
+
+correspondence:
+  ponder: false
+
+# Safe first-live policy: one standard, casual, human 5+3 game at a time.
+# Widen this only after the first live game passes clock and log review.
+challenge:
+  concurrency: 1
+  games_reserved_for_humans: 0
+  sort_by: "first"
+  preference: "human"
+  accept_bot: false
+  only_bot: false
+  min_base: 300
+  max_base: 300
+  min_increment: 3
+  max_increment: 3
+  variants:
+    - standard
+  time_controls:
+    - blitz
+  modes:
+    - casual
+  bullet_requires_increment: true
+  max_simultaneous_games_per_user: 1
+
+greeting:
+  hello: "Hi, {opponent}! I'm Kepler, a homemade C++ chess engine. Good luck!"
+  goodbye: "Good game!"
+  hello_spectators: "Kepler is a homemade C++ chess engine."
+  goodbye_spectators: "Thanks for watching!"
+
+matchmaking:
+  allow_matchmaking: false
+  challenge_filter: "none"
+  rating_preference: "none"

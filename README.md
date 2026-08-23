@@ -81,6 +81,51 @@ go movetime 1000
 Syzygy probing is optional. Place Fathom’s `tbprobe.h` and `tbprobe.c` under
 `external/fathom/`, then configure with `-DKEPLER_SYZYGY=ON`.
 
+### Lichess BOT deployment
+
+Kepler supports the standard-chess UCI flow used by the official
+[`lichess-bot`](https://github.com/lichess-bot-devs/lichess-bot) bridge. The
+deployment wrapper pins the tested bridge revision under ignored `.local/`
+state and uses an exact dependency lock, keeps the OAuth token out of files
+and command-line arguments, builds the Release engine, and runs an offline
+bridge/clock smoke test:
+
+```bash
+python3 tools/lichess_bot.py setup
+python3 tools/lichess_bot.py status
+python3 tools/lichess_bot.py smoke
+```
+
+The committed first-live policy accepts one standard, casual, human 5+3 game
+at a time. It disables pondering, variants, bot opponents, rated games,
+automatic matchmaking, online move sources, automatic draws, and resigning.
+Review `deploy/lichess/config.yml` before widening that policy.
+
+The Lichess account must have never played a game. While signed into that
+account, create a personal OAuth token with only the `bot:play` scope using
+the [official token
+instructions](https://github.com/lichess-bot-devs/lichess-bot/wiki/How-to-create-a-Lichess-OAuth-token).
+Load it without writing it into shell history or the repository:
+
+```bash
+read -s LICHESS_BOT_TOKEN
+export LICHESS_BOT_TOKEN
+```
+
+Converting an account to BOT status is irreversible. After checking the
+username and confirming it has zero games, run the one-time upgrade command:
+
+```bash
+python3 tools/lichess_bot.py upgrade --confirm-irreversible --verbose
+```
+
+The upgrade command starts the bot after conversion. Later sessions use
+`python3 tools/lichess_bot.py run`; prefix it with `caffeinate -i` on macOS if
+the machine might otherwise sleep. Press Ctrl-C once to stop accepting games
+and finish active games. PGNs are written under `deploy/lichess/games/` and
+bridge logs remain under ignored `.local/` state. Revoke the token from
+Lichess immediately if it is ever exposed.
+
 ---
 
 ## NNUE Workflow
@@ -328,6 +373,7 @@ src/        Engine core and headers (move generation, search, eval, UCI, NNUE)
 tools/      Data generation, training, curation, gauntlets
 models/     Baseline NNUE files
 tests/      Move-generation/perft regression suite
+deploy/     Secret-free deployment configuration (including Lichess BOT)
 ```
 
 ---
@@ -344,6 +390,7 @@ Key scripts:
 - `tools/reference_ladder.py` - joint full-strength reference calibration
 - `tools/curate_dataset.py` - dataset curation + split generation
 - `tools/train_nnue_pipeline.py` - training with validation tracking
+- `tools/lichess_bot.py` - pinned Lichess bridge setup, smoke, upgrade, and run wrapper
 
 ---
 
@@ -368,5 +415,7 @@ correctness guardrail for position and move-generation changes.
 
 This is a personal research project. Keep generated builds and training output
 outside version control, and run perft after position or move-generation edits.
-Using this on sites like lichess and chess.com can result in a ban and is
-discouraged.
+Never run Kepler on a normal human account or through browser automation.
+Lichess use is supported only through an explicitly converted BOT account and
+the official Bot API deployment above; other sites require their own written
+bot policy and authorization.
