@@ -33,6 +33,7 @@ struct SearchResult
     Move bestMove{};
     int score = 0;
     int depth = 0;
+    int elapsedMs = 0;
     uint64_t nodes = 0;
     uint64_t qnodes = 0;
 };

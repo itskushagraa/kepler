@@ -41,11 +41,15 @@ engine:
   uci_options:
     Hash: 256
     Threads: 4
-    MoveOverhead: 150
+    # Measured move POSTs are commonly 0.7--0.8 seconds. Kepler accounts for
+    # this on every anticipated move, so bullet does not spend the network
+    # portion of its clock on search.
+    MoveOverhead: 900
     UseBaseline: true
 
 abort_time: 30
-move_overhead: 1500
+# Keep a separate last-second reserve in the bridge for setup and HTTP jitter.
+move_overhead: 3000
 rate_limiting_delay: 100
 max_takebacks_accepted: 0
 quit_after_all_games_finish: true
@@ -55,8 +59,8 @@ pgn_file_grouping: "all"
 correspondence:
   ponder: false
 
-# Post-smoke policy: one standard, casual, human game at a time. Accept 3+0
-# and slower real-time controls; keep bullet and correspondence disabled.
+# One standard, casual, human game at a time. Accept 1+0 bullet and slower
+# real-time controls; correspondence remains disabled.
 challenge:
   concurrency: 1
   games_reserved_for_humans: 0
@@ -64,13 +68,14 @@ challenge:
   preference: "human"
   accept_bot: false
   only_bot: false
-  min_base: 180
+  min_base: 60
   max_base: 10800
   min_increment: 0
   max_increment: 180
   variants:
     - standard
   time_controls:
+    - bullet
     - blitz
     - rapid
     - classical

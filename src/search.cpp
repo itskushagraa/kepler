@@ -484,7 +484,12 @@ struct SearchState
         int score = 0;
     };
 
-    std::atomic<bool> *stopFlag = nullptr;
+    // The caller-owned flag handles UCI `stop`; sharedStopFlag is private to
+    // one search and lets any worker stop the whole Lazy-SMP team.  Keeping
+    // them separate means a normally completed timed search does not look
+    // externally cancelled.
+    std::atomic<bool> *externalStopFlag = nullptr;
+    std::atomic<bool> *sharedStopFlag = nullptr;
     std::atomic<uint64_t> *sharedNodeCounter = nullptr;
     uint64_t sharedNodeLimit = 0;
     TranspositionTable *tt = nullptr;
@@ -537,14 +542,14 @@ bool reserveSearchNode(SearchState &st)
                 std::memory_order_relaxed,
                 std::memory_order_relaxed))
         {
-            if (current + 1 >= st.sharedNodeLimit && st.stopFlag)
-                st.stopFlag->store(true, std::memory_order_relaxed);
+            if (current + 1 >= st.sharedNodeLimit && st.sharedStopFlag)
+                st.sharedStopFlag->store(true, std::memory_order_relaxed);
             return true;
         }
     }
 
-    if (st.stopFlag)
-        st.stopFlag->store(true, std::memory_order_relaxed);
+    if (st.sharedStopFlag)
+        st.sharedStopFlag->store(true, std::memory_order_relaxed);
     return false;
 }
 
@@ -775,7 +780,9 @@ int scoreMove(const Position &pos, const Move &m, const Move &ttMove, int ply, c
 
 bool shouldStop(SearchState &st)
 {
-    if (st.stopFlag && st.stopFlag->load(std::memory_order_relaxed))
+    if (st.externalStopFlag && st.externalStopFlag->load(std::memory_order_relaxed))
+        return true;
+    if (st.sharedStopFlag && st.sharedStopFlag->load(std::memory_order_relaxed))
         return true;
     if (st.nodeLimit > 0 && (int)totalNodes(st) >= st.nodeLimit)
         return true;
@@ -783,8 +790,8 @@ bool shouldStop(SearchState &st)
     {
         if (elapsedMs(st) >= st.hardTimeLimitMs)
         {
-            if (st.stopFlag)
-                st.stopFlag->store(true, std::memory_order_relaxed);
+            if (st.sharedStopFlag)
+                st.sharedStopFlag->store(true, std::memory_order_relaxed);
             return true;
         }
     }
@@ -1256,19 +1263,22 @@ SearchResult searchSingle(
     Position &pos,
     const SearchLimits &limits,
     TranspositionTable &tt,
-    std::atomic<bool> &stopFlag,
+    std::atomic<bool> &externalStopFlag,
+    std::atomic<bool> &sharedStopFlag,
+    std::chrono::steady_clock::time_point sharedStart,
+    const TimeBudget &timeBudget,
     int workerId,
     std::atomic<uint64_t> *sharedNodeCounter)
 {
     SearchState st;
-    st.stopFlag = &stopFlag;
+    st.externalStopFlag = &externalStopFlag;
+    st.sharedStopFlag = &sharedStopFlag;
     st.sharedNodeCounter = sharedNodeCounter;
     st.sharedNodeLimit = limits.nodes > 0 ? static_cast<uint64_t>(limits.nodes) : 0;
     st.tt = &tt;
     st.nodes = 0;
     st.qnodes = 0;
-    st.start = std::chrono::steady_clock::now();
-    const TimeBudget timeBudget = calculateTimeBudget(pos, limits);
+    st.start = sharedStart;
     st.hardTimeLimitMs = timeBudget.maximumMs;
     st.softTimeLimitMs = timeBudget.optimumMs;
     st.adaptiveTimeManagement = timeBudget.adaptive;
@@ -1602,6 +1612,7 @@ SearchResult searchSingle(
 
     result.nodes = st.nodes;
     result.qnodes = st.qnodes;
+    result.elapsedMs = elapsedMs(st);
 
     // Safety fallback: never return null move when legal moves exist.
     if (result.bestMove.from == 0 && result.bestMove.to == 0 &&
@@ -1620,6 +1631,9 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
 {
     tt.newSearch();
 
+    const auto sharedStart = std::chrono::steady_clock::now();
+    const TimeBudget timeBudget = calculateTimeBudget(pos, limits);
+    std::atomic<bool> sharedStopFlag{false};
     std::atomic<uint64_t> sharedNodeCounter{0};
     std::atomic<uint64_t> *sharedCounter = limits.nodes > 0 ? &sharedNodeCounter : nullptr;
 
@@ -1633,7 +1647,9 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     threadCount = std::min(threadCount, 32);
 
     if (threadCount <= 1)
-        return searchSingle(pos, singleLimits, tt, stopFlag, 0, sharedCounter);
+        return searchSingle(
+            pos, singleLimits, tt, stopFlag, sharedStopFlag,
+            sharedStart, timeBudget, 0, sharedCounter);
 
     std::vector<SearchResult> workerResults(threadCount);
     std::vector<std::thread> workers;
@@ -1649,6 +1665,9 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
             localLimits,
             tt,
             stopFlag,
+            sharedStopFlag,
+            sharedStart,
+            timeBudget,
             workerId,
             sharedCounter);
     };
@@ -1656,6 +1675,12 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     for (int id = 1; id < threadCount; ++id)
         workers.emplace_back(workerFn, id);
     workerFn(0);
+
+    // Worker zero owns the published result.  Once it has completed a usable
+    // iteration there is no reason to let a helper consume the rest of the
+    // hard budget: request cancellation before joining them.  Previously a
+    // helper in a large iteration could delay `bestmove` by many seconds.
+    sharedStopFlag.store(true, std::memory_order_relaxed);
     for (auto &w : workers)
         w.join();
 
@@ -1690,31 +1715,32 @@ TimeBudget calculateTimeBudget(const Position &pos, const SearchLimits &limits)
     if (remaining <= 0)
         return {};
 
-    const int safeRemaining = std::max(1, remaining - limits.moveOverheadMs);
-    int movesHorizon = limits.movesToGo;
-    if (movesHorizon <= 0)
-    {
-        const int phase = std::min(
-            24,
-            popcount(pos.pieceBB[WN] | pos.pieceBB[BN] |
-                     pos.pieceBB[WB] | pos.pieceBB[BB]) +
-                2 * popcount(pos.pieceBB[WR] | pos.pieceBB[BR]) +
-                4 * popcount(pos.pieceBB[WQ] | pos.pieceBB[BQ]));
-        const int phaseHorizon = 16 + (20 * phase) / 24;
-        const int moveNumberHorizon = std::clamp(50 - pos.fullmoveNumber, 12, 36);
-        movesHorizon = (phaseHorizon + moveNumberHorizon) / 2;
-    }
+    const int overhead = std::max(0, limits.moveOverheadMs);
+    const int safeRemaining = std::max(1, remaining - overhead);
+
+    // In sudden death, never assume that a late or low-material position is
+    // close to ending.  Technical endings can consume another fifty moves;
+    // the old 12--16 move estimate deliberately spent *more* time in exactly
+    // the positions where flag safety matters most.
+    int movesHorizon = limits.movesToGo > 0 ? limits.movesToGo : 50;
     movesHorizon = std::clamp(movesHorizon, 1, 50);
 
-    const int64_t base = safeRemaining / movesHorizon +
+    // Preserve ten percent of the clock and charge MoveOverhead for every
+    // anticipated move, not merely once.  That distinction is essential for
+    // remote bullet play where HTTP latency is often larger than search time.
+    const int64_t clockShare =
+        (static_cast<int64_t>(safeRemaining) * 9) / (10 * movesHorizon);
+    const int64_t base = clockShare - overhead +
                          (static_cast<int64_t>(increment) * 3) / 4;
-    const int64_t minimum = std::max(1, safeRemaining / 100);
+    const int64_t minimum = std::min<int64_t>(
+        safeRemaining, std::clamp<int64_t>(remaining / 1000, 1, 10));
     const int64_t optimum = std::clamp<int64_t>(base, minimum, safeRemaining);
-    const int64_t rawHardCap = movesHorizon == 1 ? safeRemaining : std::max(1, safeRemaining / 2);
+    const int64_t rawHardCap = movesHorizon == 1
+                                   ? safeRemaining
+                                   : std::max<int64_t>(optimum, safeRemaining / 5);
     const int64_t hardCap = std::max(optimum, rawHardCap);
     const int64_t maximum = std::clamp<int64_t>(
-        std::max(optimum * 4,
-                 (static_cast<int64_t>(safeRemaining) * 2) / movesHorizon + increment),
+        optimum * 2,
         optimum,
         hardCap);
     return {static_cast<int>(optimum), static_cast<int>(maximum), true};

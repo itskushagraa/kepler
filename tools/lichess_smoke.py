@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,10 +22,19 @@ import chess  # noqa: E402
 import chess.engine  # noqa: E402
 from lib.config import load_config  # noqa: E402
 from lib import engine_wrapper  # noqa: E402
+from lib.timer import seconds  # noqa: E402
 
 
 def main() -> int:
     config = load_config(str(CONFIG_PATH))
+
+    # Kepler patches the pinned bridge's fixed ten-second first move. Verify
+    # that 1+0 gets a bullet-sized movetime before starting an engine.
+    first_move = engine_wrapper.first_move_time(
+        SimpleNamespace(id="kepler-first-move-smoke", clock_initial=seconds(60))
+    )
+    if first_move.time is None or not 0.1 <= first_move.time <= 0.6:
+        raise RuntimeError(f"unsafe bullet first-move limit: {first_move.time}")
 
     # This exercises the bridge's own config validation, UCI option discovery,
     # startup, isready exchange, and clean shutdown without contacting Lichess.
@@ -53,7 +63,7 @@ def main() -> int:
             board.push(result.move)
 
     print(
-        "PASS: official lichess-bot loaded Kepler and two clock-managed legal moves completed."
+        "PASS: patched lichess-bot loaded Kepler; bullet first-move and clock-managed searches completed."
     )
     return 0
 

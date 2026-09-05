@@ -215,7 +215,7 @@ void runUciLoop()
             std::cout << "option name Hash type spin default 64 min 1 max 1024\n";
             std::cout << "option name Threads type spin default 1 min 1 max 128\n";
             std::cout << "option name Contempt type spin default 0 min -100 max 100\n";
-            std::cout << "option name MoveOverhead type spin default 10 min 0 max 500\n";
+            std::cout << "option name MoveOverhead type spin default 10 min 0 max 5000\n";
             std::cout << "option name UsePruning type check default true\n";
             std::cout << "option name NNUEWeight type spin default 25 min 0 max 100\n";
             std::cout << "option name NNUEClamp type spin default 300 min 0 max 10000\n";
@@ -290,7 +290,7 @@ void runUciLoop()
                 {
                     overhead = moveOverheadMs;
                 }
-                moveOverheadMs = std::clamp(overhead, 0, 500);
+                moveOverheadMs = std::clamp(overhead, 0, 5000);
             }
             else if (name == "UsePruning")
             {

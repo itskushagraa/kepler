@@ -86,8 +86,12 @@ in both move generation and evaluation.
 
 Clock searches distinguish an optimum and a hard budget. Kepler adjusts the
 optimum after each completed iteration using best-move and score stability,
-the root score gap, and aspiration re-searches. Explicit `go movetime`, fixed
-depth, and fixed node searches retain their fixed-limit behavior.
+the root score gap, and aspiration re-searches. All Lazy-SMP workers share one
+clock and are cancelled when the main worker is ready, so joining helpers
+cannot delay `bestmove`. Sudden-death allocation keeps a conservative
+50-move horizon and charges `MoveOverhead` per anticipated move; explicit
+`go movetime`, fixed depth, and fixed node searches retain their fixed-limit
+behavior.
 
 The built-in deterministic-position benchmark makes NPS and thread scaling
 easy to inspect without playing games:
@@ -130,7 +134,9 @@ python3 tools/lichess_bot.py smoke
 ```
 
 The committed live policy accepts one standard, casual, human real-time game
-at a time, from 3+0 through classical controls. It disables bullet,
+at a time, from 1+0 bullet through classical controls. The setup applies a
+small tracked patch to the pinned bridge so its special first move scales down
+to 600 ms in 1+0 instead of always consuming ten seconds. It disables
 correspondence, pondering, variants, bot opponents, rated games, automatic
 matchmaking, online move sources, automatic draws, and resigning. Review
 `deploy/lichess/config.yml` before widening that policy.

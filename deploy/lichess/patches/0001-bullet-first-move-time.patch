@@ -1,0 +1,16 @@
+diff --git a/lib/engine_wrapper.py b/lib/engine_wrapper.py
+--- a/lib/engine_wrapper.py
++++ b/lib/engine_wrapper.py
+@@ -699,7 +699,10 @@ def first_move_time(game: model.Game) -> chess.engine.Limit:
+     :param game: The game that the bot is playing.
+     :return: The time to choose the first move.
+     """
+-    # Need to hardcode first movetime since Lichess has 30 sec limit.
+-    search_time = seconds(10)
++    # Lichess uses a special first-move deadline, so a clock command cannot be
++    # used here.  Scale the fixed movetime for fast controls instead of making
++    # every bot wait ten seconds.  This is at most one second in slow games and
++    # 600 ms in 1+0 bullet, with a small floor for very short custom controls.
++    search_time = max(msec(100), min(seconds(1), game.clock_initial / 100))
+     logger.info(f"Searching for time {sec_str(search_time)} seconds for game {game.id}")
+     return chess.engine.Limit(time=to_seconds(search_time), clock_id="first move")

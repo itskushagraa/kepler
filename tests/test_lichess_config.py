@@ -30,15 +30,14 @@ class LichessDeploymentTests(unittest.TestCase):
         self.assertEqual(self.config["token"], "set-via-LICHESS_BOT_TOKEN")
         self.assertNotIn("Bearer ", CONFIG_PATH.read_text(encoding="utf-8"))
 
-    def test_live_policy_is_standard_casual_three_plus_zero_or_slower(self):
+    def test_live_policy_is_standard_casual_one_plus_zero_or_slower(self):
         challenge = self.config["challenge"]
         self.assertEqual(challenge["concurrency"], 1)
         self.assertEqual(challenge["variants"], ["standard"])
-        self.assertEqual(challenge["time_controls"], ["blitz", "rapid", "classical"])
-        self.assertNotIn("bullet", challenge["time_controls"])
+        self.assertEqual(challenge["time_controls"], ["bullet", "blitz", "rapid", "classical"])
         self.assertNotIn("correspondence", challenge["time_controls"])
         self.assertEqual(challenge["modes"], ["casual"])
-        self.assertEqual((challenge["min_base"], challenge["max_base"]), (180, 10800))
+        self.assertEqual((challenge["min_base"], challenge["max_base"]), (60, 10800))
         self.assertEqual((challenge["min_increment"], challenge["max_increment"]), (0, 180))
         self.assertFalse(challenge["accept_bot"])
         self.assertFalse(challenge["only_bot"])
@@ -51,8 +50,19 @@ class LichessDeploymentTests(unittest.TestCase):
         self.assertEqual(engine["working_dir"], "../..")
         self.assertEqual(
             engine["uci_options"],
-            {"Hash": 256, "Threads": 4, "MoveOverhead": 150, "UseBaseline": True},
+            {"Hash": 256, "Threads": 4, "MoveOverhead": 900, "UseBaseline": True},
         )
+        self.assertEqual(self.config["move_overhead"], 3000)
+
+    def test_pinned_bridge_has_bullet_first_move_patch(self):
+        self.assertTrue(LICHESS.BRIDGE_PATCHES)
+        for patch in LICHESS.BRIDGE_PATCHES:
+            self.assertTrue(patch.is_file())
+            contents = patch.read_text(encoding="utf-8")
+            self.assertIn(
+                "+    search_time = max(msec(100), min(seconds(1), game.clock_initial / 100))",
+                contents,
+            )
 
     def test_token_is_required_for_network_commands(self):
         with mock.patch.dict(os.environ, {}, clear=True):

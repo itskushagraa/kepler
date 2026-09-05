@@ -4,6 +4,7 @@
 #include "zobrist.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <thread>
@@ -132,6 +133,7 @@ namespace
         const TimeBudget openingBudget = calculateTimeBudget(opening, clock);
         if (!openingBudget.adaptive || openingBudget.optimumMs <= 0 ||
             openingBudget.maximumMs < openingBudget.optimumMs ||
+            openingBudget.maximumMs > openingBudget.optimumMs * 2 ||
             openingBudget.maximumMs > clock.wtimeMs - clock.moveOverheadMs)
         {
             std::cerr << "invalid adaptive opening time budget\n";
@@ -150,9 +152,43 @@ namespace
         Position endgame;
         endgame.fromFEN("8/8/8/3k4/8/4K3/4P3/8 w - - 0 35");
         const TimeBudget endgameBudget = calculateTimeBudget(endgame, clock);
-        if (endgameBudget.optimumMs <= openingBudget.optimumMs)
+        if (endgameBudget.optimumMs != openingBudget.optimumMs ||
+            endgameBudget.maximumMs != openingBudget.maximumMs)
         {
-            std::cerr << "game phase did not affect sudden-death allocation\n";
+            std::cerr << "endgame incorrectly shortened the sudden-death horizon\n";
+            return false;
+        }
+
+        SearchLimits bullet;
+        bullet.wtimeMs = 57000; // 1+0 after the bridge's three-second reserve.
+        bullet.moveOverheadMs = 900;
+        bullet.threads = 4;
+        bullet.printInfo = false;
+        const TimeBudget bulletBudget = calculateTimeBudget(opening, bullet);
+        if (bulletBudget.optimumMs < 50 || bulletBudget.optimumMs > 150 ||
+            bulletBudget.maximumMs > 300)
+        {
+            std::cerr << "unsafe 1+0 budget: optimum=" << bulletBudget.optimumMs
+                      << " maximum=" << bulletBudget.maximumMs << "\n";
+            return false;
+        }
+
+        SearchLimits emergency = bullet;
+        emergency.wtimeMs = 2500;
+        const TimeBudget emergencyBudget = calculateTimeBudget(endgame, emergency);
+        if (emergencyBudget.optimumMs > 10 || emergencyBudget.maximumMs > 20)
+        {
+            std::cerr << "low-clock emergency budget was not activated\n";
+            return false;
+        }
+
+        SearchLimits exhausted = bullet;
+        exhausted.wtimeMs = 2000;
+        exhausted.moveOverheadMs = 5000;
+        const TimeBudget exhaustedBudget = calculateTimeBudget(endgame, exhausted);
+        if (exhaustedBudget.optimumMs != 1 || exhaustedBudget.maximumMs != 1)
+        {
+            std::cerr << "overhead-exhausted clock did not fall back to one millisecond\n";
             return false;
         }
 
@@ -166,6 +202,52 @@ namespace
         }
         return true;
     }
+
+    bool testThreadedClockDeadline()
+    {
+        Position position;
+        position.setStartPos();
+
+        SearchLimits limits;
+        limits.wtimeMs = 57000;
+        limits.moveOverheadMs = 900;
+        limits.threads = 4;
+        limits.printInfo = false;
+        const TimeBudget budget = calculateTimeBudget(position, limits);
+
+        TranspositionTable tt;
+        tt.resizeMB(16);
+        std::atomic<bool> externalStop{false};
+        const auto start = std::chrono::steady_clock::now();
+        const SearchResult result = search(position, limits, tt, externalStop);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        if (elapsed > budget.maximumMs + 300)
+        {
+            std::cerr << "threaded search overran shared hard deadline: elapsed="
+                      << elapsed << " maximum=" << budget.maximumMs << "\n";
+            return false;
+        }
+        const auto helperJoinMs = elapsed - result.elapsedMs;
+        if (helperJoinMs > 100)
+        {
+            std::cerr << "helper threads delayed the main result by "
+                      << helperJoinMs << " ms\n";
+            return false;
+        }
+        if (externalStop.load(std::memory_order_relaxed))
+        {
+            std::cerr << "normal timed completion polluted the UCI stop flag\n";
+            return false;
+        }
+        if (result.depth <= 0)
+        {
+            std::cerr << "bullet deadline returned without a completed iteration\n";
+            return false;
+        }
+        return true;
+    }
 }
 
 int main()
@@ -174,7 +256,8 @@ int main()
     Zobrist::init();
     if (!testHashSizingAndRoundTrip() ||
         !testConcurrentTranspositionAccess() ||
-        !testTimeBudgets())
+        !testTimeBudgets() ||
+        !testThreadedClockDeadline())
     {
         return EXIT_FAILURE;
     }

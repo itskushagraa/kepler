@@ -3,6 +3,7 @@
 
 import subprocess
 import sys
+import time
 
 
 def run(engine: str, commands: list[str]) -> str:
@@ -16,6 +17,60 @@ def run(engine: str, commands: list[str]) -> str:
         check=True,
     )
     return completed.stdout
+
+
+def read_until(process: subprocess.Popen[str], marker: str) -> list[str]:
+    lines: list[str] = []
+    assert process.stdout is not None
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            raise AssertionError(f"engine exited before {marker}: {lines}")
+        lines.append(line)
+        if marker in line:
+            return lines
+
+
+def timed_bullet_search(engine: str) -> tuple[float, str]:
+    process = subprocess.Popen(
+        [engine],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None
+    try:
+        process.stdin.write("uci\n")
+        process.stdin.flush()
+        uci_output = "".join(read_until(process, "uciok"))
+        expected = "option name MoveOverhead type spin default 10 min 0 max 5000"
+        if expected not in uci_output:
+            raise AssertionError(uci_output)
+
+        process.stdin.write(
+            "setoption name Threads value 4\n"
+            "setoption name MoveOverhead value 900\n"
+            "isready\n"
+        )
+        process.stdin.flush()
+        read_until(process, "readyok")
+
+        process.stdin.write(
+            "position startpos\n"
+            "go wtime 57000 btime 57000 winc 0 binc 0\n"
+        )
+        process.stdin.flush()
+        start = time.monotonic()
+        search_lines = read_until(process, "bestmove")
+        elapsed = time.monotonic() - start
+        return elapsed, "".join(search_lines)
+    finally:
+        if process.poll() is None:
+            process.stdin.write("quit\n")
+            process.stdin.flush()
+        process.wait(timeout=5)
 
 
 def main() -> int:
@@ -55,7 +110,11 @@ def main() -> int:
     if "scorecp 0" not in repetition:
         raise AssertionError(repetition)
 
-    print("UCI mate and repetition rules passed")
+    elapsed, bullet = timed_bullet_search(engine)
+    if "bestmove 0000" in bullet or elapsed > 1.0:
+        raise AssertionError(f"unsafe threaded bullet search ({elapsed:.3f}s):\n{bullet}")
+
+    print(f"UCI rules and threaded bullet deadline passed ({elapsed:.3f}s)")
     return 0
 
 

@@ -15,6 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_DIR = REPO_ROOT / ".local" / "lichess-bot"
 BRIDGE_URL = "https://github.com/lichess-bot-devs/lichess-bot.git"
 BRIDGE_COMMIT = "df7e730de58cc3ef2f1415a0dc2eeda842d39167"
+BRIDGE_PATCHES = (
+    REPO_ROOT / "deploy" / "lichess" / "patches" / "0001-bullet-first-move-time.patch",
+)
 VENV_PYTHON = BRIDGE_DIR / ".venv" / "bin" / "python"
 CONFIG_PATH = REPO_ROOT / "deploy" / "lichess" / "config.yml"
 LOCK_PATH = REPO_ROOT / "deploy" / "lichess" / "requirements.lock.txt"
@@ -43,6 +46,31 @@ def bridge_head() -> str | None:
     return result.stdout.strip()
 
 
+def bridge_patch_applied(patch: Path) -> bool:
+    if not (BRIDGE_DIR / ".git").is_dir() or not patch.is_file():
+        return False
+    result = subprocess.run(
+        ["git", "apply", "--reverse", "--check", str(patch)],
+        cwd=BRIDGE_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def bridge_patches_applied() -> bool:
+    return all(bridge_patch_applied(patch) for patch in BRIDGE_PATCHES)
+
+
+def apply_bridge_patches() -> None:
+    for patch in BRIDGE_PATCHES:
+        if not patch.is_file():
+            raise SystemExit(f"Missing required bridge patch: {patch}")
+        if not bridge_patch_applied(patch):
+            run_checked(["git", "apply", "--whitespace=nowarn", patch], BRIDGE_DIR)
+
+
 def ensure_bridge() -> None:
     if not (BRIDGE_DIR / ".git").is_dir():
         BRIDGE_DIR.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +82,7 @@ def ensure_bridge() -> None:
         # for local bridge development; the pin keeps production reproducible.
         run_checked(["git", "fetch", "--depth", "1", "origin", BRIDGE_COMMIT], BRIDGE_DIR)
         run_checked(["git", "checkout", "--detach", BRIDGE_COMMIT], BRIDGE_DIR)
+    apply_bridge_patches()
 
 
 def ensure_venv() -> None:
@@ -76,6 +105,8 @@ def require_local_install() -> None:
     missing = []
     if bridge_head() != BRIDGE_COMMIT:
         missing.append(f"official bridge pinned at {BRIDGE_COMMIT[:8]}")
+    if not bridge_patches_applied():
+        missing.append("Kepler bridge patches (run setup again)")
     if not VENV_PYTHON.is_file():
         missing.append("bridge virtual environment")
     if not ENGINE_PATH.is_file():
@@ -128,6 +159,7 @@ def command_status(_: argparse.Namespace) -> int:
     checks = {
         "bridge_commit": bridge_head() or "missing",
         "bridge_pinned": bridge_head() == BRIDGE_COMMIT,
+        "bridge_patches": bridge_patches_applied(),
         "venv_python": VENV_PYTHON.is_file(),
         "release_engine": ENGINE_PATH.is_file(),
         "config": CONFIG_PATH.is_file(),
@@ -135,7 +167,8 @@ def command_status(_: argparse.Namespace) -> int:
     }
     for key, value in checks.items():
         print(f"{key}: {value}")
-    return 0 if all(checks[key] for key in ["bridge_pinned", "venv_python", "release_engine", "config"]) else 1
+    required = ["bridge_pinned", "bridge_patches", "venv_python", "release_engine", "config"]
+    return 0 if all(checks[key] for key in required) else 1
 
 
 def command_run(args: argparse.Namespace) -> int:

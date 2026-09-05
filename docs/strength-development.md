@@ -80,9 +80,12 @@ paths were simplified:
   share precomputed magic-bitboard attack tables instead of scanning rays.
 - Production search is explicitly Lazy SMP; the unreachable root-split branch
   inside single-worker search was removed.
-- Clock allocation now includes material phase and moves-to-go. Completed
-  iterations adjust the soft deadline using PV/score stability, the top-two
-  root score gap, and aspiration failure count while retaining a hard bound.
+- Clock allocation uses explicit moves-to-go when supplied and otherwise
+  preserves a conservative 50-move sudden-death horizon, including endgames.
+  It reserves `MoveOverhead` for every anticipated move. Completed iterations
+  adjust the soft deadline using PV/score stability, the top-two root score
+  gap, and aspiration failure count while retaining a 2x hard bound shared by
+  every worker. The main worker cancels helpers before joining them.
 - Weight 100/clamp 0 uses NNUE directly when a model is loaded. Other blends
   intentionally retain the classical evaluation, and the production default
   is unchanged pending a promoted network.
