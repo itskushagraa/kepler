@@ -270,10 +270,10 @@ void TranspositionTable::resizeMB(int mb)
     size_t bytes = static_cast<size_t>(mb) * 1024 * 1024;
     size_t count = std::max<size_t>(1, bytes / sizeof(TTBucket));
     size_t pow2 = 1;
-    while (pow2 < count)
+    while (pow2 <= count / 2)
         pow2 <<= 1;
-    table.clear();
-    table.resize(pow2);
+    std::vector<TTBucket> replacement(pow2);
+    table.swap(replacement);
     mask = pow2 - 1;
     generation.store(1, std::memory_order_relaxed);
 }
@@ -283,7 +283,10 @@ void TranspositionTable::clear()
     for (auto &bucket : table)
     {
         for (auto &entry : bucket.entries)
-            entry = TTEntry{};
+        {
+            entry.payload.store(0, std::memory_order_relaxed);
+            entry.verification.store(0, std::memory_order_relaxed);
+        }
     }
     generation.store(1, std::memory_order_relaxed);
 }
@@ -298,21 +301,47 @@ bool TranspositionTable::probe(uint64_t key, TTEntry &out) const
     if (table.empty())
         return false;
     const size_t index = static_cast<size_t>(key & mask);
-    const size_t lockIndex = index & (kLockStripes - 1);
-    std::lock_guard<std::mutex> guard(stripeLocks[lockIndex]);
     const TTBucket &bucket = table[index];
     bool found = false;
     int bestDepth = -INF_SCORE;
-    for (const auto &e : bucket.entries)
+
+    auto unpack = [](uint64_t entryKey, uint64_t payload, TTEntry &entry)
     {
-        if (e.key == key)
+        entry.key = entryKey;
+        const uint16_t packedScore = static_cast<uint16_t>(payload & 0xFFFFULL);
+        entry.score = packedScore < 0x8000U
+                          ? static_cast<int>(packedScore)
+                          : static_cast<int>(packedScore) - 65536;
+        entry.depth = static_cast<int>((payload >> 16) & 0xFFULL) - 1;
+        entry.bound = static_cast<uint8_t>((payload >> 24) & 0x3ULL);
+        entry.generation = static_cast<uint8_t>((payload >> 26) & 0xFFULL);
+        const uint32_t move = static_cast<uint32_t>((payload >> 34) & 0x3FFFFULL);
+        entry.bestMove.from = static_cast<int>(move & 0x3F);
+        entry.bestMove.to = static_cast<int>((move >> 6) & 0x3F);
+        entry.bestMove.promoPiece = static_cast<uint8_t>((move >> 12) & 0x7);
+        entry.bestMove.isCapture = ((move >> 15) & 1U) != 0;
+        entry.bestMove.isPromotion = ((move >> 16) & 1U) != 0;
+        entry.bestMove.isCastle = ((move >> 17) & 1U) != 0;
+    };
+
+    for (const auto &slot : bucket.entries)
+    {
+        const uint64_t verification = slot.verification.load(std::memory_order_acquire);
+        const uint64_t payload = slot.payload.load(std::memory_order_relaxed);
+        if ((payload & (1ULL << 63)) == 0 ||
+            slot.verification.load(std::memory_order_acquire) != verification ||
+            (verification ^ payload) != key)
         {
-            if (!found || e.depth > bestDepth)
-            {
-                found = true;
-                bestDepth = e.depth;
-                out = e;
-            }
+            continue;
+        }
+
+        TTEntry entry;
+        unpack(key, payload, entry);
+        if (!found || entry.depth > bestDepth)
+        {
+            found = true;
+            bestDepth = entry.depth;
+            out = entry;
         }
     }
     return found;
@@ -323,33 +352,79 @@ void TranspositionTable::store(uint64_t key, int depth, int score, uint8_t bound
     if (table.empty())
         return;
     const size_t index = static_cast<size_t>(key & mask);
-    const size_t lockIndex = index & (kLockStripes - 1);
     const uint8_t gen = static_cast<uint8_t>(generation.load(std::memory_order_relaxed));
-    std::lock_guard<std::mutex> guard(stripeLocks[lockIndex]);
     TTBucket &bucket = table[index];
 
-    TTEntry *replace = &bucket.entries[0];
+    auto read = [](const TTSlot &slot, TTEntry &entry) -> bool
+    {
+        const uint64_t verification = slot.verification.load(std::memory_order_acquire);
+        const uint64_t payload = slot.payload.load(std::memory_order_relaxed);
+        if ((payload & (1ULL << 63)) == 0 ||
+            slot.verification.load(std::memory_order_acquire) != verification)
+        {
+            return false;
+        }
+        entry.key = verification ^ payload;
+        const uint16_t packedScore = static_cast<uint16_t>(payload & 0xFFFFULL);
+        entry.score = packedScore < 0x8000U
+                          ? static_cast<int>(packedScore)
+                          : static_cast<int>(packedScore) - 65536;
+        entry.depth = static_cast<int>((payload >> 16) & 0xFFULL) - 1;
+        entry.bound = static_cast<uint8_t>((payload >> 24) & 0x3ULL);
+        entry.generation = static_cast<uint8_t>((payload >> 26) & 0xFFULL);
+        const uint32_t move = static_cast<uint32_t>((payload >> 34) & 0x3FFFFULL);
+        entry.bestMove.from = static_cast<int>(move & 0x3F);
+        entry.bestMove.to = static_cast<int>((move >> 6) & 0x3F);
+        entry.bestMove.promoPiece = static_cast<uint8_t>((move >> 12) & 0x7);
+        entry.bestMove.isCapture = ((move >> 15) & 1U) != 0;
+        entry.bestMove.isPromotion = ((move >> 16) & 1U) != 0;
+        entry.bestMove.isCastle = ((move >> 17) & 1U) != 0;
+        return true;
+    };
+
+    auto pack = [](int entryDepth, int entryScore, uint8_t entryBound,
+                   uint8_t entryGeneration, const Move &move) -> uint64_t
+    {
+        const uint64_t packedScore = static_cast<uint16_t>(
+            std::clamp(entryScore, -32768, 32767));
+        const uint64_t packedDepth = static_cast<uint64_t>(
+            std::clamp(entryDepth, -1, 254) + 1);
+        uint64_t packedMove = static_cast<uint64_t>(move.from & 63);
+        packedMove |= static_cast<uint64_t>(move.to & 63) << 6;
+        packedMove |= static_cast<uint64_t>(move.promoPiece & 7) << 12;
+        packedMove |= static_cast<uint64_t>(move.isCapture) << 15;
+        packedMove |= static_cast<uint64_t>(move.isPromotion) << 16;
+        packedMove |= static_cast<uint64_t>(move.isCastle) << 17;
+        return packedScore |
+               (packedDepth << 16) |
+               (static_cast<uint64_t>(entryBound & 3) << 24) |
+               (static_cast<uint64_t>(entryGeneration) << 26) |
+               (packedMove << 34) |
+               (1ULL << 63);
+    };
+
+    TTSlot *replace = &bucket.entries[0];
     int replaceScore = INT_MAX;
 
-    for (auto &e : bucket.entries)
+    for (auto &slot : bucket.entries)
     {
+        TTEntry e;
+        const bool occupied = read(slot, e);
+        if (!occupied)
+        {
+            replace = &slot;
+            replaceScore = INT_MIN;
+            break;
+        }
+
         if (e.key == key)
         {
             if (e.depth > depth && e.bound == 3 && bound != 3)
                 return;
-            e.depth = depth;
-            e.score = score;
-            e.bound = bound;
-            e.generation = gen;
-            e.bestMove = bestMove;
+            const uint64_t payload = pack(depth, score, bound, gen, bestMove);
+            slot.payload.store(payload, std::memory_order_relaxed);
+            slot.verification.store(key ^ payload, std::memory_order_release);
             return;
-        }
-
-        if (e.key == 0)
-        {
-            replace = &e;
-            replaceScore = INT_MIN;
-            break;
         }
 
         const int age = static_cast<int>((gen - e.generation) & 0xFF);
@@ -357,16 +432,31 @@ void TranspositionTable::store(uint64_t key, int depth, int score, uint8_t bound
         if (currentScore < replaceScore)
         {
             replaceScore = currentScore;
-            replace = &e;
+            replace = &slot;
         }
     }
 
-    replace->key = key;
-    replace->depth = depth;
-    replace->score = score;
-    replace->bound = bound;
-    replace->generation = gen;
-    replace->bestMove = bestMove;
+    const uint64_t payload = pack(depth, score, bound, gen, bestMove);
+    replace->payload.store(payload, std::memory_order_relaxed);
+    replace->verification.store(key ^ payload, std::memory_order_release);
+}
+
+size_t TranspositionTable::sizeBytes() const
+{
+    return table.size() * sizeof(TTBucket);
+}
+
+size_t TranspositionTable::bucketCount() const
+{
+    return table.size();
+}
+
+bool TranspositionTable::isLockFree() const
+{
+    if (table.empty())
+        return std::atomic<uint64_t>{}.is_lock_free();
+    return table.front().entries.front().payload.is_lock_free() &&
+           table.front().entries.front().verification.is_lock_free();
 }
 
 struct ScoredMove
@@ -403,7 +493,7 @@ struct SearchState
     std::chrono::steady_clock::time_point start;
     int hardTimeLimitMs = 0;
     int softTimeLimitMs = 0;
-    int maxDepth = 0;
+    bool adaptiveTimeManagement = false;
     int nodeLimit = 0;
     int contempt = 0;
     bool usePruning = true;
@@ -1178,9 +1268,10 @@ SearchResult searchSingle(
     st.nodes = 0;
     st.qnodes = 0;
     st.start = std::chrono::steady_clock::now();
-    st.hardTimeLimitMs = limits.movetimeMs;
-    st.softTimeLimitMs = (limits.movetimeMs > 0) ? (limits.movetimeMs * 95) / 100 : 0;
-    st.maxDepth = limits.depth;
+    const TimeBudget timeBudget = calculateTimeBudget(pos, limits);
+    st.hardTimeLimitMs = timeBudget.maximumMs;
+    st.softTimeLimitMs = timeBudget.optimumMs;
+    st.adaptiveTimeManagement = timeBudget.adaptive;
     st.nodeLimit = limits.nodes;
     st.contempt = limits.contempt;
     st.usePruning = limits.usePruning;
@@ -1258,120 +1349,21 @@ SearchResult searchSingle(
                          { return a.score > b.score; });
     }
 
-    auto rootSearch = [&](int depth, int alpha, int beta, Move &bestMoveOut, int &bestScoreOut) -> bool
+    auto rootSearch = [&](int depth, int alpha, int beta, Move &bestMoveOut,
+                          int &bestScoreOut, int &secondBestScoreOut,
+                          bool &lateBestMoveChangeOut) -> bool
     {
         Side us = pos.sideToMove;
         Side them = (us == WHITE ? BLACK : WHITE);
 
-        const int requestedThreads = std::max(1, limits.threads);
-        const bool useParallelRoot = requestedThreads > 1 && rootMoves.size() > 1 && depth > 1;
-
-        if (useParallelRoot)
-        {
-            std::atomic<size_t> nextIndex{0};
-            std::vector<int> moveScores(rootMoves.size(), -INF_SCORE);
-            std::vector<char> moveSearched(rootMoves.size(), 0);
-            std::vector<uint64_t> workerNodes(requestedThreads, 0);
-            std::vector<uint64_t> workerQnodes(requestedThreads, 0);
-
-            auto worker = [&](int workerId)
-            {
-                while (true)
-                {
-                    if (stopFlag.load(std::memory_order_relaxed))
-                        break;
-                    const size_t idx = nextIndex.fetch_add(1, std::memory_order_relaxed);
-                    if (idx >= rootMoves.size())
-                        break;
-
-                    const Move m = rootMoves[idx].move;
-                    Position childPos = pos;
-                    if (!castlePathSafe(childPos, m, us, them))
-                        continue;
-
-                    Undo u;
-                    childPos.makeMove(m, u);
-                    if (childPos.isSquareAttacked(childPos.kingSquare[us], them))
-                    {
-                        childPos.unmakeMove(m, u);
-                        continue;
-                    }
-
-                    SearchState child = st;
-                    child.nodes = 0;
-                    child.qnodes = 0;
-                    child.tt = nullptr; // Avoid TT races in root-split mode.
-                    child.nodeLimit = 0;
-                    child.repHistory = st.repHistory;
-                    child.repHistory.push_back(childPos.hashKey);
-                    child.moveStack[0] = moveId(m);
-
-                    int score = -negamax(childPos, child, depth - 1, -beta, -alpha, 1);
-                    childPos.unmakeMove(m, u);
-
-                    workerNodes[workerId] += child.nodes;
-                    workerQnodes[workerId] += child.qnodes;
-
-                    if (stopFlag.load(std::memory_order_relaxed))
-                        break;
-
-                    moveScores[idx] = score;
-                    moveSearched[idx] = 1;
-                }
-            };
-
-            const int numWorkers = std::min<int>(requestedThreads, static_cast<int>(rootMoves.size()));
-            std::vector<std::thread> workers;
-            workers.reserve(numWorkers);
-            for (int i = 0; i < numWorkers; ++i)
-                workers.emplace_back(worker, i);
-            for (auto &t : workers)
-                t.join();
-
-            for (int i = 0; i < numWorkers; ++i)
-            {
-                st.nodes += workerNodes[i];
-                st.qnodes += workerQnodes[i];
-            }
-
-            if (shouldStop(st))
-                return false;
-
-            int bestScore = -INF_SCORE;
-            Move bestMove{};
-            bool searchedAny = false;
-            for (size_t i = 0; i < rootMoves.size(); ++i)
-            {
-                if (!moveSearched[i])
-                    continue;
-                searchedAny = true;
-                rootMoves[i].score = moveScores[i];
-                if (moveScores[i] > bestScore)
-                {
-                    bestScore = moveScores[i];
-                    bestMove = rootMoves[i].move;
-                }
-            }
-
-            if (!searchedAny)
-            {
-                bestMoveOut = Move{};
-                bestScoreOut = 0;
-                return true;
-            }
-
-            bestMoveOut = bestMove;
-            bestScoreOut = bestScore;
-            std::stable_sort(rootMoves.begin(), rootMoves.end(), [](const RootMoveEntry &a, const RootMoveEntry &b)
-                             { return a.score > b.score; });
-            return true;
-        }
-
         int localAlpha = alpha;
         int bestScore = -INF_SCORE;
+        int secondBestScore = -INF_SCORE;
         Move bestMove{};
         bool searchedAny = false;
         bool searchedPvMove = false;
+        int searchedRootMoves = 0;
+        bool lateBestMoveChange = false;
 
         for (auto &rm : rootMoves)
         {
@@ -1388,6 +1380,7 @@ SearchResult searchSingle(
             }
 
             searchedAny = true;
+            ++searchedRootMoves;
             st.repHistory.push_back(pos.hashKey);
             int prevMoveStack = st.moveStack[0];
             st.moveStack[0] = moveId(m);
@@ -1415,8 +1408,18 @@ SearchResult searchSingle(
             rm.score = score;
             if (score > bestScore)
             {
+                if (bestScore != -INF_SCORE &&
+                    searchedRootMoves * 2 >= static_cast<int>(rootMoves.size()))
+                {
+                    lateBestMoveChange = true;
+                }
+                secondBestScore = bestScore;
                 bestScore = score;
                 bestMove = m;
+            }
+            else if (score > secondBestScore)
+            {
+                secondBestScore = score;
             }
             if (score > localAlpha)
                 localAlpha = score;
@@ -1428,17 +1431,23 @@ SearchResult searchSingle(
         {
             bestMoveOut = Move{};
             bestScoreOut = 0;
+            secondBestScoreOut = -INF_SCORE;
+            lateBestMoveChangeOut = false;
             return true;
         }
 
         bestMoveOut = bestMove;
         bestScoreOut = bestScore;
+        secondBestScoreOut = secondBestScore;
+        lateBestMoveChangeOut = lateBestMoveChange;
         std::stable_sort(rootMoves.begin(), rootMoves.end(), [](const RootMoveEntry &a, const RootMoveEntry &b)
                          { return a.score > b.score; });
         return true;
     };
 
     int maxDepth = (limits.depth > 0) ? limits.depth : 64;
+    Move previousBestMove{};
+    int stableBestMoveIterations = 0;
     for (int d = 1; d <= maxDepth; ++d)
     {
         if (shouldStop(st))
@@ -1453,6 +1462,8 @@ SearchResult searchSingle(
         int window = 50;
         int reSearches = 0;
         Move depthBestMove = result.bestMove;
+        int secondBestScore = -INF_SCORE;
+        bool lateBestMoveChange = false;
 
         if (d >= 4)
         {
@@ -1464,10 +1475,15 @@ SearchResult searchSingle(
         {
             Move trialBestMove{};
             int trialScore = 0;
-            if (!rootSearch(d, alpha, beta, trialBestMove, trialScore))
+            int trialSecondBestScore = -INF_SCORE;
+            bool trialLateBestMoveChange = false;
+            if (!rootSearch(d, alpha, beta, trialBestMove, trialScore,
+                            trialSecondBestScore, trialLateBestMoveChange))
                 break;
             score = trialScore;
             depthBestMove = trialBestMove;
+            secondBestScore = trialSecondBestScore;
+            lateBestMoveChange = trialLateBestMoveChange;
             if (shouldStop(st))
                 break;
 
@@ -1500,6 +1516,13 @@ SearchResult searchSingle(
         if (shouldStop(st))
             break;
 
+        const int scoreChange = d > 1 ? std::abs(score - lastScore) : INF_SCORE;
+        if (d > 1 && sameMove(depthBestMove, previousBestMove))
+            ++stableBestMoveIterations;
+        else
+            stableBestMoveIterations = 1;
+        previousBestMove = depthBestMove;
+
         result.bestMove = depthBestMove;
         result.score = score;
         result.depth = d;
@@ -1527,8 +1550,54 @@ SearchResult searchSingle(
                       << " time " << elapsed << " string qnodes " << st.qnodes << "\n";
         }
 
-        if (st.softTimeLimitMs > 0 && elapsed >= st.softTimeLimitMs)
-            break;
+        if (st.softTimeLimitMs > 0)
+        {
+            int timeScale = 100;
+            if (st.adaptiveTimeManagement)
+            {
+                const int scoreGap = secondBestScore <= -INF_SCORE / 2
+                                         ? INF_SCORE
+                                         : std::max(0, score - secondBestScore);
+
+                // Stable, clearly separated choices can return time to the
+                // clock. PV changes, score swings, close alternatives, and
+                // aspiration failures earn progressively more of the hard
+                // budget.
+                if (stableBestMoveIterations >= 3 && scoreChange <= 12 &&
+                    scoreGap >= 70 && reSearches == 0)
+                {
+                    timeScale = 55;
+                }
+                else if (stableBestMoveIterations >= 2 && scoreChange <= 20 &&
+                         scoreGap >= 40 && reSearches == 0)
+                {
+                    timeScale = 75;
+                }
+                else
+                {
+                    if (stableBestMoveIterations == 1)
+                        timeScale = std::max(timeScale, 135);
+                    if (scoreChange > 80)
+                        timeScale = std::max(timeScale, 145);
+                    else if (scoreChange > 35)
+                        timeScale = std::max(timeScale, 120);
+                    if (scoreGap < 25)
+                        timeScale = std::max(timeScale, 125);
+                    if (lateBestMoveChange)
+                        timeScale = std::max(timeScale, 140);
+                    if (reSearches >= 2)
+                        timeScale = std::max(timeScale, 150);
+                    else if (reSearches == 1)
+                        timeScale = std::max(timeScale, 125);
+                }
+            }
+
+            const int iterationLimit = std::min(
+                st.hardTimeLimitMs,
+                std::max(1, (st.softTimeLimitMs * timeScale) / 100));
+            if (elapsed >= iterationLimit)
+                break;
+        }
     }
 
     result.nodes = st.nodes;
@@ -1604,6 +1673,51 @@ SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTabl
     best.nodes = totalNodes;
     best.qnodes = totalQnodes;
     return best;
+}
+
+TimeBudget calculateTimeBudget(const Position &pos, const SearchLimits &limits)
+{
+    if (limits.movetimeMs > 0)
+    {
+        return {static_cast<int>(std::max<int64_t>(1, (static_cast<int64_t>(limits.movetimeMs) * 95) / 100)),
+                limits.movetimeMs, false};
+    }
+    if (limits.infinite || limits.depth > 0 || limits.nodes > 0)
+        return {};
+
+    const int remaining = pos.sideToMove == WHITE ? limits.wtimeMs : limits.btimeMs;
+    const int increment = pos.sideToMove == WHITE ? limits.wincMs : limits.bincMs;
+    if (remaining <= 0)
+        return {};
+
+    const int safeRemaining = std::max(1, remaining - limits.moveOverheadMs);
+    int movesHorizon = limits.movesToGo;
+    if (movesHorizon <= 0)
+    {
+        const int phase = std::min(
+            24,
+            popcount(pos.pieceBB[WN] | pos.pieceBB[BN] |
+                     pos.pieceBB[WB] | pos.pieceBB[BB]) +
+                2 * popcount(pos.pieceBB[WR] | pos.pieceBB[BR]) +
+                4 * popcount(pos.pieceBB[WQ] | pos.pieceBB[BQ]));
+        const int phaseHorizon = 16 + (20 * phase) / 24;
+        const int moveNumberHorizon = std::clamp(50 - pos.fullmoveNumber, 12, 36);
+        movesHorizon = (phaseHorizon + moveNumberHorizon) / 2;
+    }
+    movesHorizon = std::clamp(movesHorizon, 1, 50);
+
+    const int64_t base = safeRemaining / movesHorizon +
+                         (static_cast<int64_t>(increment) * 3) / 4;
+    const int64_t minimum = std::max(1, safeRemaining / 100);
+    const int64_t optimum = std::clamp<int64_t>(base, minimum, safeRemaining);
+    const int64_t rawHardCap = movesHorizon == 1 ? safeRemaining : std::max(1, safeRemaining / 2);
+    const int64_t hardCap = std::max(optimum, rawHardCap);
+    const int64_t maximum = std::clamp<int64_t>(
+        std::max(optimum * 4,
+                 (static_cast<int64_t>(safeRemaining) * 2) / movesHorizon + increment),
+        optimum,
+        hardCap);
+    return {static_cast<int>(optimum), static_cast<int>(maximum), true};
 }
 
 bool isSearchMateScore(int score)

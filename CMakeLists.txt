@@ -98,6 +98,19 @@ add_executable(search_correctness
 target_include_directories(search_correctness PRIVATE src)
 add_test(NAME search_correctness COMMAND search_correctness)
 
+add_executable(search_infrastructure
+    tests/search_infrastructure.cpp
+    src/position.cpp
+    src/movegen.cpp
+    src/eval.cpp
+    src/search.cpp
+    src/zobrist.cpp
+    src/nnue.cpp
+    src/tb.cpp
+)
+target_include_directories(search_infrastructure PRIVATE src)
+add_test(NAME search_infrastructure COMMAND search_infrastructure)
+
 add_executable(position_roundtrip
     tests/position_roundtrip.cpp
     src/position.cpp

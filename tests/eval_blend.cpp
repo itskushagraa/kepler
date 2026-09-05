@@ -1,4 +1,5 @@
 #include "eval.hpp"
+#include "movegen.hpp"
 #include "nnue.hpp"
 #include "position.hpp"
 
@@ -7,6 +8,7 @@
 
 int main(int argc, char **argv)
 {
+    initAttackTables();
     if (argc != 2 || !Nnue::loadFromFile(argv[1]))
     {
         std::cerr << "Usage: eval_blend <model.nnue>\n";

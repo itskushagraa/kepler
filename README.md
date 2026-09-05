@@ -78,6 +78,39 @@ go movetime 1000
 300 centipawns); set it to 0 to disable the clamp. Loading a non-empty
 `EvalFile` selects that model persistently across `ucinewgame`.
 
+`Hash` is a strict memory ceiling: the power-of-two table is rounded down and
+will never allocate more than the requested number of MiB. Search uses one
+Lazy-SMP worker per configured thread and a shared lock-free transposition
+table. Sliding rook, bishop, and queen attacks use magic-bitboard lookup tables
+in both move generation and evaluation.
+
+Clock searches distinguish an optimum and a hard budget. Kepler adjusts the
+optimum after each completed iteration using best-move and score stability,
+the root score gap, and aspiration re-searches. Explicit `go movetime`, fixed
+depth, and fixed node searches retain their fixed-limit behavior.
+
+The built-in deterministic-position benchmark makes NPS and thread scaling
+easy to inspect without playing games:
+
+```text
+setoption name Threads value 1
+bench 6
+setoption name Threads value 2
+bench 6
+setoption name Threads value 4
+bench 6
+```
+
+Repeat each configuration several times and compare the `bench total` lines;
+wall-clock NPS is machine- and load-dependent. `bench 6 diff` also compares a
+run with the preceding benchmark in the same engine session.
+
+The current baseline remains at NNUE weight 25/clamp 300 until a replacement
+network passes the documented static calibration and paired A/B gate. A
+validated full-NNUE configuration at weight 100/clamp 0 now bypasses the
+classical evaluator entirely, so that experiment measures both strength and
+the available NPS gain instead of paying for both evaluation paths.
+
 Syzygy probing is optional. Place Fathom’s `tbprobe.h` and `tbprobe.c` under
 `external/fathom/`, then configure with `-DKEPLER_SYZYGY=ON`.
 

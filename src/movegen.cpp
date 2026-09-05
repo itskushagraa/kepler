@@ -1,6 +1,7 @@
 #include "movegen.hpp"
+#include <array>
+#include <cstdlib>
 #include <iostream>
-#include <vector>
 
 Bitboard KNIGHT_ATTACKS[64];
 Bitboard KING_ATTACKS[64];
@@ -35,177 +36,212 @@ void MoveList::print() const
 const int knightOffsets[8] = {17, 15, 10, 6, -17, -15, -10, -6};
 const int kingOffsets[8] = {8, -8, 1, -1, 9, 7, -9, -7};
 
+namespace
+{
+    constexpr std::array<Bitboard, 64> kRookMagics = {
+        0x8a80104000800020ULL, 0x0140002000100040ULL, 0x02801880a0017001ULL, 0x0100081001000420ULL,
+        0x0200020010080420ULL, 0x03001c0002010008ULL, 0x8480008002000100ULL, 0x2080088004402900ULL,
+        0x0000800098204000ULL, 0x2024401000200040ULL, 0x0100802000801000ULL, 0x0120800800801000ULL,
+        0x0208808088000400ULL, 0x0002802200800400ULL, 0x2200800100020080ULL, 0x0801000060821100ULL,
+        0x0080044006422000ULL, 0x0100808020004000ULL, 0x12108a0010204200ULL, 0x0140848010000802ULL,
+        0x0481828014002800ULL, 0x8094004002004100ULL, 0x4010040010010802ULL, 0x0000020008806104ULL,
+        0x0100400080208000ULL, 0x2040002120081000ULL, 0x0021200680100081ULL, 0x0020100080080080ULL,
+        0x0002000a00200410ULL, 0x0000020080800400ULL, 0x0080088400100102ULL, 0x0080004600042881ULL,
+        0x4040008040800020ULL, 0x0440003000200801ULL, 0x0004200011004500ULL, 0x0188020010100100ULL,
+        0x0014800401802800ULL, 0x2080040080800200ULL, 0x0124080204001001ULL, 0x0200046502000484ULL,
+        0x0480400080088020ULL, 0x1000422010034000ULL, 0x0030200100110040ULL, 0x0000100021010009ULL,
+        0x2002080100110004ULL, 0x0202008004008002ULL, 0x0020020004010100ULL, 0x2048440040820001ULL,
+        0x0101002200408200ULL, 0x0040802000401080ULL, 0x4008142004410100ULL, 0x02060820c0120200ULL,
+        0x0001001004080100ULL, 0x020c020080040080ULL, 0x2935610830022400ULL, 0x0044440041009200ULL,
+        0x0280001040802101ULL, 0x2100190040002085ULL, 0x80c0084100102001ULL, 0x4024081001000421ULL,
+        0x00020030a0244872ULL, 0x0012001008414402ULL, 0x02006104900a0804ULL, 0x0001004081002402ULL};
+
+    constexpr std::array<Bitboard, 64> kBishopMagics = {
+        0x0040040844404084ULL, 0x002004208a004208ULL, 0x0010190041080202ULL, 0x0108060845042010ULL,
+        0x0581104180800210ULL, 0x2112080446200010ULL, 0x1080820820060210ULL, 0x03c0808410220200ULL,
+        0x0004050404440404ULL, 0x0000021001420088ULL, 0x24d0080801082102ULL, 0x0001020a0a020400ULL,
+        0x0000040308200402ULL, 0x0004011002100800ULL, 0x0401484104104005ULL, 0x0801010402020200ULL,
+        0x00400210c3880100ULL, 0x0404022024108200ULL, 0x0810018200204102ULL, 0x0004002801a02003ULL,
+        0x0085040820080400ULL, 0x810102c808880400ULL, 0x000e900410884800ULL, 0x8002020480840102ULL,
+        0x0220200865090201ULL, 0x2010100a02021202ULL, 0x0152048408022401ULL, 0x0020080002081110ULL,
+        0x4001001021004000ULL, 0x800040400a011002ULL, 0x00e4004081011002ULL, 0x001c004001012080ULL,
+        0x8004200962a00220ULL, 0x8422100208500202ULL, 0x2000402200300c08ULL, 0x8646020080080080ULL,
+        0x80020a0200100808ULL, 0x2010004880111000ULL, 0x623000a080011400ULL, 0x42008c0340209202ULL,
+        0x0209188240001000ULL, 0x400408a884001800ULL, 0x00110400a6080400ULL, 0x1840060a44020800ULL,
+        0x0090080104000041ULL, 0x0201011000808101ULL, 0x1a2208080504f080ULL, 0x8012020600211212ULL,
+        0x0500861011240000ULL, 0x0180806108200800ULL, 0x4000020e01040044ULL, 0x300000261044000aULL,
+        0x0802241102020002ULL, 0x0020906061210001ULL, 0x5a84841004010310ULL, 0x0004010801011c04ULL,
+        0x000a010109502200ULL, 0x0000004a02012000ULL, 0x500201010098b028ULL, 0x8040002811040900ULL,
+        0x0028000010020204ULL, 0x06000020202d0240ULL, 0x8918844842082200ULL, 0x4010011029020020ULL};
+
+    std::array<Bitboard, 64> rookMasks{};
+    std::array<Bitboard, 64> bishopMasks{};
+    std::array<unsigned, 64> rookShifts{};
+    std::array<unsigned, 64> bishopShifts{};
+    std::array<std::array<Bitboard, 4096>, 64> rookAttackTable{};
+    std::array<std::array<Bitboard, 512>, 64> bishopAttackTable{};
+
+    bool inBounds(int rank, int file)
+    {
+        return rank >= 0 && rank < 8 && file >= 0 && file < 8;
+    }
+
+    Bitboard slidingAttacksSlow(int sq, Bitboard occupancy, const int directions[][2], int directionCount)
+    {
+        Bitboard attacks = 0;
+        const int rank = sq >> 3;
+        const int file = sq & 7;
+        for (int direction = 0; direction < directionCount; ++direction)
+        {
+            int targetRank = rank + directions[direction][0];
+            int targetFile = file + directions[direction][1];
+            while (inBounds(targetRank, targetFile))
+            {
+                const int target = targetRank * 8 + targetFile;
+                attacks |= ONE << target;
+                if (occupancy & (ONE << target))
+                    break;
+                targetRank += directions[direction][0];
+                targetFile += directions[direction][1];
+            }
+        }
+        return attacks;
+    }
+
+    Bitboard relevantMask(int sq, const int directions[][2], int directionCount)
+    {
+        Bitboard mask = 0;
+        const int rank = sq >> 3;
+        const int file = sq & 7;
+        for (int direction = 0; direction < directionCount; ++direction)
+        {
+            int targetRank = rank + directions[direction][0];
+            int targetFile = file + directions[direction][1];
+            while (inBounds(targetRank, targetFile))
+            {
+                const int nextRank = targetRank + directions[direction][0];
+                const int nextFile = targetFile + directions[direction][1];
+                if (!inBounds(nextRank, nextFile))
+                    break;
+                mask |= ONE << (targetRank * 8 + targetFile);
+                targetRank = nextRank;
+                targetFile = nextFile;
+            }
+        }
+        return mask;
+    }
+
+    template <size_t TableSize>
+    void initializeSliderTable(
+        int sq,
+        Bitboard mask,
+        Bitboard magic,
+        unsigned shift,
+        const int directions[][2],
+        int directionCount,
+        std::array<Bitboard, TableSize> &table)
+    {
+        std::array<bool, TableSize> initialized{};
+        Bitboard subset = 0;
+        do
+        {
+            const size_t index = static_cast<size_t>((subset * magic) >> shift);
+            const Bitboard attacks = slidingAttacksSlow(sq, subset, directions, directionCount);
+            if (index >= TableSize || (initialized[index] && table[index] != attacks))
+            {
+                std::cerr << "invalid sliding magic at square " << sq
+                          << " index " << index << "\n";
+                std::abort();
+            }
+            table[index] = attacks;
+            initialized[index] = true;
+            subset = (subset - mask) & mask;
+        } while (subset != 0);
+    }
+}
+
 void initAttackTables()
 {
-    for (int sq = 0; sq < 64; ++sq)
+    static const bool initialized = []
     {
-        Bitboard b = ONE << sq;
-        Bitboard attacks = 0ULL;
-
-        int r = sq / 8, f = sq % 8;
-        for (int off : knightOffsets)
+        constexpr int rookDirections[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        constexpr int bishopDirections[4][2] = {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int sq = 0; sq < 64; ++sq)
         {
-            int target = sq + off;
-            int tr = target / 8, tf = target % 8;
-            if (target >= 0 && target < 64 && std::max(abs(tr - r), abs(tf - f)) <= 2)
-                attacks |= (ONE << target);
-        }
-        KNIGHT_ATTACKS[sq] = attacks;
+            Bitboard attacks = 0ULL;
 
-        attacks = 0ULL;
-        for (int off : kingOffsets)
-        {
-            int target = sq + off;
-            int tr = target / 8, tf = target % 8;
-            if (target >= 0 && target < 64 && std::max(abs(tr - r), abs(tf - f)) == 1)
-                attacks |= (ONE << target);
+            int r = sq / 8, f = sq % 8;
+            for (int off : knightOffsets)
+            {
+                int target = sq + off;
+                int tr = target / 8, tf = target % 8;
+                if (target >= 0 && target < 64 && std::max(abs(tr - r), abs(tf - f)) <= 2)
+                    attacks |= (ONE << target);
+            }
+            KNIGHT_ATTACKS[sq] = attacks;
+
+            attacks = 0ULL;
+            for (int off : kingOffsets)
+            {
+                int target = sq + off;
+                int tr = target / 8, tf = target % 8;
+                if (target >= 0 && target < 64 && std::max(abs(tr - r), abs(tf - f)) == 1)
+                    attacks |= (ONE << target);
+            }
+            KING_ATTACKS[sq] = attacks;
+
+            rookMasks[sq] = relevantMask(sq, rookDirections, 4);
+            bishopMasks[sq] = relevantMask(sq, bishopDirections, 4);
+            rookShifts[sq] = 64U - static_cast<unsigned>(popcount(rookMasks[sq]));
+            bishopShifts[sq] = 64U - static_cast<unsigned>(popcount(bishopMasks[sq]));
+            initializeSliderTable(
+                sq, rookMasks[sq], kRookMagics[sq], rookShifts[sq],
+                rookDirections, 4, rookAttackTable[sq]);
+            initializeSliderTable(
+                sq, bishopMasks[sq], kBishopMagics[sq], bishopShifts[sq],
+                bishopDirections, 4, bishopAttackTable[sq]);
         }
-        KING_ATTACKS[sq] = attacks;
-    }
+        return true;
+    }();
+    (void)initialized;
 }
 
 // ------------------------------------------------------------
-// Sliding-piece helpers (directional ray scans)
+// Sliding-piece helpers (magic-bitboard attack tables)
 // ------------------------------------------------------------
-static inline bool in_bounds(int r, int f) { return (r >= 0 && r < 8 && f >= 0 && f < 8); }
-
-static inline void gen_ray_from_square(
-    int from, int dr, int df,
-    Bitboard friends, Bitboard enemies,
-    MoveList &ml)
-{
-    int r = from / 8, f = from % 8;
-    int tr = r + dr, tf = f + df;
-    while (in_bounds(tr, tf))
-    {
-        int to = tr * 8 + tf;
-        if (get_bit(friends, to))
-            break; // blocked by our own piece
-        if (get_bit(enemies, to))
-        { // capture and stop
-            ml.add(from, to, /*capture=*/true);
-            break;
-        }
-        ml.add(from, to); // quiet
-        tr += dr;
-        tf += df;
-    }
-}
-
 void generateSliderMoves(const Position &pos, MoveList &ml)
 {
-    // friends/enemies masks for each side
-    Bitboard whiteFriends = pos.occupancy[WHITE];
-    Bitboard blackFriends = pos.occupancy[BLACK];
-    Bitboard whiteEnemies = blackFriends;
-    Bitboard blackEnemies = whiteFriends;
+    const Side side = pos.sideToMove;
+    const Bitboard friends = pos.occupancy[side];
+    const Bitboard enemies = pos.occupancy[side == WHITE ? BLACK : WHITE];
 
-    if (pos.sideToMove == WHITE)
+    auto addMoves = [&](Bitboard pieces, bool diagonal, bool orthogonal)
     {
-        // ----- WHITE SLIDERS -----
-        // Rooks
+        while (pieces)
         {
-            Bitboard bb = pos.pieceBB[WR];
-            while (bb)
+            const int from = lsb(pieces);
+            pieces &= pieces - 1;
+            Bitboard destinations = 0;
+            if (diagonal)
+                destinations |= bishopAttacks(from, pos.allPieces);
+            if (orthogonal)
+                destinations |= rookAttacks(from, pos.allPieces);
+            destinations &= ~friends;
+            while (destinations)
             {
-                int from = lsb(bb);
-                bb &= bb - 1;
-
-                // 4 rook rays
-                gen_ray_from_square(from, +1, 0, whiteFriends, whiteEnemies, ml); // north
-                gen_ray_from_square(from, -1, 0, whiteFriends, whiteEnemies, ml); // south
-                gen_ray_from_square(from, 0, +1, whiteFriends, whiteEnemies, ml); // east
-                gen_ray_from_square(from, 0, -1, whiteFriends, whiteEnemies, ml); // west
+                const int to = lsb(destinations);
+                destinations &= destinations - 1;
+                ml.add(from, to, get_bit(enemies, to));
             }
         }
-        // Bishops
-        {
-            Bitboard bb = pos.pieceBB[WB];
-            while (bb)
-            {
-                int from = lsb(bb);
-                bb &= bb - 1;
+    };
 
-                // 4 bishop rays
-                gen_ray_from_square(from, +1, +1, whiteFriends, whiteEnemies, ml); // NE
-                gen_ray_from_square(from, +1, -1, whiteFriends, whiteEnemies, ml); // NW
-                gen_ray_from_square(from, -1, +1, whiteFriends, whiteEnemies, ml); // SE
-                gen_ray_from_square(from, -1, -1, whiteFriends, whiteEnemies, ml); // SW
-            }
-        }
-        // Queens = rook + bishop rays
-        {
-            Bitboard bb = pos.pieceBB[WQ];
-            while (bb)
-            {
-                int from = lsb(bb);
-                bb &= bb - 1;
-
-                // Rook-like
-                gen_ray_from_square(from, +1, 0, whiteFriends, whiteEnemies, ml);
-                gen_ray_from_square(from, -1, 0, whiteFriends, whiteEnemies, ml);
-                gen_ray_from_square(from, 0, +1, whiteFriends, whiteEnemies, ml);
-                gen_ray_from_square(from, 0, -1, whiteFriends, whiteEnemies, ml);
-                // Bishop-like
-                gen_ray_from_square(from, +1, +1, whiteFriends, whiteEnemies, ml);
-                gen_ray_from_square(from, +1, -1, whiteFriends, whiteEnemies, ml);
-                gen_ray_from_square(from, -1, +1, whiteFriends, whiteEnemies, ml);
-                gen_ray_from_square(from, -1, -1, whiteFriends, whiteEnemies, ml);
-            }
-        }
-    }
-
-    else
-    {
-        // ----- BLACK SLIDERS -----
-        // Rooks
-        {
-            Bitboard bb = pos.pieceBB[BR];
-            while (bb)
-            {
-                int from = lsb(bb);
-                bb &= bb - 1;
-
-                gen_ray_from_square(from, +1, 0, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, -1, 0, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, 0, +1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, 0, -1, blackFriends, blackEnemies, ml);
-            }
-        }
-        // Bishops
-        {
-            Bitboard bb = pos.pieceBB[BB];
-            while (bb)
-            {
-                int from = lsb(bb);
-                bb &= bb - 1;
-
-                gen_ray_from_square(from, +1, +1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, +1, -1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, -1, +1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, -1, -1, blackFriends, blackEnemies, ml);
-            }
-        }
-        // Queens
-        {
-            Bitboard bb = pos.pieceBB[BQ];
-            while (bb)
-            {
-                int from = lsb(bb);
-                bb &= bb - 1;
-
-                gen_ray_from_square(from, +1, 0, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, -1, 0, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, 0, +1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, 0, -1, blackFriends, blackEnemies, ml);
-
-                gen_ray_from_square(from, +1, +1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, +1, -1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, -1, +1, blackFriends, blackEnemies, ml);
-                gen_ray_from_square(from, -1, -1, blackFriends, blackEnemies, ml);
-            }
-        }
-    }
+    const int rook = side == WHITE ? WR : BR;
+    const int bishop = side == WHITE ? WB : BB;
+    const int queen = side == WHITE ? WQ : BQ;
+    addMoves(pos.pieceBB[rook], false, true);
+    addMoves(pos.pieceBB[bishop], true, false);
+    addMoves(pos.pieceBB[queen], true, true);
 
     // ---------- CASTLING (TEMP BASIC VERSION) ----------
     if (pos.sideToMove == WHITE)
@@ -264,77 +300,17 @@ void generateSliderMoves(const Position &pos, MoveList &ml)
 // Returns all squares a bishop attacks from `sq` given current occupancy
 Bitboard bishopAttacks(int sq, Bitboard occ)
 {
-    Bitboard attacks = 0ULL;
-    int rank = sq / 8, file = sq % 8;
-
-    // NE
-    for (int r = rank + 1, f = file + 1; r < 8 && f < 8; r++, f++)
-    {
-        attacks |= (1ULL << (r * 8 + f));
-        if (occ & (1ULL << (r * 8 + f)))
-            break;
-    }
-    // NW
-    for (int r = rank + 1, f = file - 1; r < 8 && f >= 0; r++, f--)
-    {
-        attacks |= (1ULL << (r * 8 + f));
-        if (occ & (1ULL << (r * 8 + f)))
-            break;
-    }
-    // SE
-    for (int r = rank - 1, f = file + 1; r >= 0 && f < 8; r--, f++)
-    {
-        attacks |= (1ULL << (r * 8 + f));
-        if (occ & (1ULL << (r * 8 + f)))
-            break;
-    }
-    // SW
-    for (int r = rank - 1, f = file - 1; r >= 0 && f >= 0; r--, f--)
-    {
-        attacks |= (1ULL << (r * 8 + f));
-        if (occ & (1ULL << (r * 8 + f)))
-            break;
-    }
-
-    return attacks;
+    const Bitboard blockers = occ & bishopMasks[sq];
+    const size_t index = static_cast<size_t>((blockers * kBishopMagics[sq]) >> bishopShifts[sq]);
+    return bishopAttackTable[sq][index];
 }
 
 // Returns all squares a rook attacks from `sq` given current occupancy
 Bitboard rookAttacks(int sq, Bitboard occ)
 {
-    Bitboard attacks = 0ULL;
-    int rank = sq / 8, file = sq % 8;
-
-    // North
-    for (int r = rank + 1; r < 8; r++)
-    {
-        attacks |= (1ULL << (r * 8 + file));
-        if (occ & (1ULL << (r * 8 + file)))
-            break;
-    }
-    // South
-    for (int r = rank - 1; r >= 0; r--)
-    {
-        attacks |= (1ULL << (r * 8 + file));
-        if (occ & (1ULL << (r * 8 + file)))
-            break;
-    }
-    // East
-    for (int f = file + 1; f < 8; f++)
-    {
-        attacks |= (1ULL << (rank * 8 + f));
-        if (occ & (1ULL << (rank * 8 + f)))
-            break;
-    }
-    // West
-    for (int f = file - 1; f >= 0; f--)
-    {
-        attacks |= (1ULL << (rank * 8 + f));
-        if (occ & (1ULL << (rank * 8 + f)))
-            break;
-    }
-
-    return attacks;
+    const Bitboard blockers = occ & rookMasks[sq];
+    const size_t index = static_cast<size_t>((blockers * kRookMagics[sq]) >> rookShifts[sq]);
+    return rookAttackTable[sq][index];
 }
 
 void generatePawnMoves(const Position &pos, MoveList &ml)

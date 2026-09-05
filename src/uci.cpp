@@ -844,21 +844,6 @@ void runUciLoop()
 
             limits.moveOverheadMs = moveOverheadMs;
 
-            if (limits.movetimeMs == 0 && !limits.infinite && limits.depth == 0 && limits.nodes == 0)
-            {
-                int remain = (pos.sideToMove == WHITE) ? limits.wtimeMs : limits.btimeMs;
-                int inc = (pos.sideToMove == WHITE) ? limits.wincMs : limits.bincMs;
-                if (remain > 0)
-                {
-                    int safeRemain = std::max(1, remain - limits.moveOverheadMs);
-                    int mtg = (limits.movesToGo > 0) ? limits.movesToGo : 30;
-                    int target = safeRemain / std::max(10, mtg) + (inc * 3) / 4;
-                    int minSpend = std::max(5, safeRemain / 80);
-                    int maxSpend = std::max(20, safeRemain / 2);
-                    limits.movetimeMs = std::clamp(target, minSpend, maxSpend);
-                }
-            }
-
             stopFlag.store(false, std::memory_order_relaxed);
             searching.store(true, std::memory_order_relaxed);
             Position searchPos = pos;

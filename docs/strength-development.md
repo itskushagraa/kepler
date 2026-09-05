@@ -68,6 +68,29 @@ print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0), y.no
 PY
 ```
 
+## Performance foundation (2026-09-05)
+
+Before adding or retuning more pruning heuristics, the engine's main known hot
+paths were simplified:
+
+- The shared four-way clustered TT publishes packed entries through lock-free
+  64-bit atomics with XOR verification. Probes and stores no longer acquire a
+  striped mutex, and `Hash` allocations round down to the requested ceiling.
+- Slider move generation, attack detection, SEE, and classical mobility now
+  share precomputed magic-bitboard attack tables instead of scanning rays.
+- Production search is explicitly Lazy SMP; the unreachable root-split branch
+  inside single-worker search was removed.
+- Clock allocation now includes material phase and moves-to-go. Completed
+  iterations adjust the soft deadline using PV/score stability, the top-two
+  root score gap, and aspiration failure count while retaining a hard bound.
+- Weight 100/clamp 0 uses NNUE directly when a model is loaded. Other blends
+  intentionally retain the classical evaluation, and the production default
+  is unchanged pending a promoted network.
+
+Use repeated `bench 6` runs at Threads 1, 2, and 4 to assess NPS scaling, then
+use the existing paired A/B protocol to decide whether a performance or timing
+change improves Elo. NPS alone is not a promotion result.
+
 ## 0. Establish a clean tested binary
 
 ```bash

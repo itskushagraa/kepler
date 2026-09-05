@@ -1,8 +1,8 @@
 #pragma once
 #include <atomic>
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <vector>
 #include "movegen.hpp"
 
@@ -37,6 +37,13 @@ struct SearchResult
     uint64_t qnodes = 0;
 };
 
+struct TimeBudget
+{
+    int optimumMs = 0;
+    int maximumMs = 0;
+    bool adaptive = false;
+};
+
 struct TTEntry
 {
     uint64_t key = 0;
@@ -55,22 +62,46 @@ public:
     void newSearch();
     bool probe(uint64_t key, TTEntry &out) const;
     void store(uint64_t key, int depth, int score, uint8_t bound, const Move &bestMove);
+    size_t sizeBytes() const;
+    size_t bucketCount() const;
+    bool isLockFree() const;
 
 private:
+    // Each slot is published as an atomic payload plus an XOR verification
+    // word. Readers validate the pair and reject inconsistent publications
+    // without serializing every node on a mutex or creating a C++ data race.
+    struct TTSlot
+    {
+        std::atomic<uint64_t> verification{0};
+        std::atomic<uint64_t> payload{0};
+
+        TTSlot() noexcept = default;
+        TTSlot(const TTSlot &other) noexcept
+            : verification(other.verification.load(std::memory_order_relaxed)),
+              payload(other.payload.load(std::memory_order_relaxed)) {}
+        TTSlot &operator=(const TTSlot &other) noexcept
+        {
+            verification.store(other.verification.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            payload.store(other.payload.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+        TTSlot(TTSlot &&other) noexcept : TTSlot(other) {}
+        TTSlot &operator=(TTSlot &&other) noexcept { return operator=(other); }
+    };
+
     struct TTBucket
     {
         static constexpr int kClusterSize = 4;
-        std::array<TTEntry, kClusterSize> entries{};
+        std::array<TTSlot, kClusterSize> entries{};
     };
 
     std::vector<TTBucket> table;
     size_t mask = 0;
     std::atomic<uint32_t> generation{1};
-    static constexpr size_t kLockStripes = 4096;
-    mutable std::array<std::mutex, kLockStripes> stripeLocks{};
 };
 
 SearchResult search(Position &pos, const SearchLimits &limits, TranspositionTable &tt, std::atomic<bool> &stopFlag);
+TimeBudget calculateTimeBudget(const Position &pos, const SearchLimits &limits);
 
 constexpr int SEARCH_MATE_SCORE = 30000;
 bool isSearchMateScore(int score);

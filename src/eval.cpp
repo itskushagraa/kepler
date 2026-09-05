@@ -495,20 +495,34 @@ int nnueClamp()
 
 int evaluate(const Position &pos, bool *usedNnue)
 {
-    const int classical = evaluateClassical(pos);
-    const int classicalStm = (pos.sideToMove == WHITE) ? classical : -classical;
-
     const int weight = nnueWeight();
     if (weight == 0)
     {
         if (usedNnue)
             *usedNnue = false;
+        const int classical = evaluateClassical(pos);
+        const int classicalStm = (pos.sideToMove == WHITE) ? classical : -classical;
         return classicalStm;
     }
 
     int nnueScore = 0;
     auto &acc = const_cast<Position &>(pos).nnueAccumulator;
-    if (Nnue::evaluate(pos, acc, nnueScore))
+    const bool nnueAvailable = Nnue::evaluate(pos, acc, nnueScore);
+
+    // A promoted full-NNUE configuration should not also pay for mobility,
+    // pawn structure, king safety, and every other handcrafted term. Keep the
+    // classical evaluation only as the model-load fallback in this mode.
+    if (nnueAvailable && weight == 100 && nnueClamp() == 0)
+    {
+        if (usedNnue)
+            *usedNnue = true;
+        return nnueScore;
+    }
+
+    const int classical = evaluateClassical(pos);
+    const int classicalStm = (pos.sideToMove == WHITE) ? classical : -classical;
+
+    if (nnueAvailable)
     {
         if (usedNnue)
             *usedNnue = true;

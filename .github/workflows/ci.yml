@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: deploy/lichess/requirements.lock.txt
+
+      - name: Install Python test dependencies
+        run: python -m pip install chess==1.11.2 numpy PyYAML==6.0.3
+
+      - name: Configure
+        run: cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-release --parallel 2
+
+      - name: Native regression suite
+        run: ctest --test-dir build-release --output-on-failure
+
+      - name: Perft smoke suite
+        run: ./build-release/perft --smoke
+
+      - name: Python unit suite
+        run: python -m unittest discover -s tests -p 'test_*.py'
